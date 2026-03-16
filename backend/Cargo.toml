@@ -1,0 +1,22 @@
+[package]
+name = "mbox-browser-backend"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mboxshell = { git = "https://github.com/lilman218/mboxshell" }
+memmap2 = "0.9"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+chrono = { version = "0.4", features = ["serde"] }
+walkdir = "2"
+regex = "1"
+futures = "0.3"
+hex = "0.4"
+base64 = "0.22"

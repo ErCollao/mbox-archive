@@ -1,0 +1,20 @@
+services:
+  backend:
+    build: ./backend
+    # No ports exposed to host, only accessible within docker network
+    volumes:
+      - ./data:/data
+      - index-data:/index
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3132:3000"
+    environment:
+      - BACKEND_URL=http://backend:3000
+    depends_on:
+      - backend
+
+volumes:
+  index-data:
