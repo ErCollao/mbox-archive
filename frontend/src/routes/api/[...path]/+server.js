@@ -3,6 +3,20 @@ import { env } from '$env/dynamic/private';
 
 const BACKEND_URL = env.BACKEND_URL || 'http://backend:3000';
 
+/**
+ * Forward the backend response, preserving security headers
+ * (CSP sandbox / nosniff) alongside the content type.
+ */
+function forwarded(response) {
+    const headers = new Headers();
+    for (const key of ['content-type', 'content-security-policy', 'x-content-type-options']) {
+        const value = response.headers.get(key);
+        if (value) headers.set(key, value);
+    }
+    if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+    return headers;
+}
+
 /** @type {import('./$types').RequestHandler} */
 export async function GET({ params, url }) {
     const targetUrl = `${BACKEND_URL}/api/${params.path}${url.search}`;
@@ -12,9 +26,7 @@ export async function GET({ params, url }) {
             throw error(response.status, await response.text());
         }
         const data = await response.text();
-        return new Response(data, {
-            headers: { 'content-type': response.headers.get('content-type') || 'application/json' }
-        });
+        return new Response(data, { headers: forwarded(response) });
     } catch (e) {
         console.error('Proxy GET error:', e);
         throw error(500, 'Backend unavailable');
@@ -31,9 +43,7 @@ export async function POST({ params, request }) {
             headers: { 'content-type': 'application/json' }
         });
         const data = await response.text();
-        return new Response(data, {
-            headers: { 'content-type': response.headers.get('content-type') || 'application/json' }
-        });
+        return new Response(data, { headers: forwarded(response) });
     } catch (e) {
         console.error('Proxy POST error:', e);
         throw error(500, 'Backend unavailable');

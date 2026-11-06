@@ -4,7 +4,7 @@ WORKDIR /usr/src/app
 # Added git to fetch dependencies from github
 RUN apt-get update && apt-get install -y pkg-config libssl-dev libzstd-dev git && rm -rf /var/lib/apt/lists/*
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --locked
 
 FROM debian:stable-slim
 # Final image needs libzstd too

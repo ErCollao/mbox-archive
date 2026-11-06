@@ -3,7 +3,7 @@ services:
     build: ./backend
     # No ports exposed to host, only accessible within docker network
     volumes:
-      - ./data:/data
+      - ${DATA_DIR:-./data}:/data
       - index-data:/index
     restart: unless-stopped
 

@@ -8,7 +8,7 @@ axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-mboxshell = { git = "https://github.com/lilman218/mboxshell" }
+mboxshell = "1.3.0"
 memmap2 = "0.9"
 anyhow = "1"
 tracing = "0.1"

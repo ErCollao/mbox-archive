@@ -1,6 +1,12 @@
 <script>
+    import { onMount } from 'svelte';
+
     let query = "";
     let emails = [];
+    let mode = "inbox"; // "inbox" | "search"
+    let searchBodies = false;
+    let hasMore = false;
+    let offset = 0;
     let selectedEmail = null;
     let selectedEmailContent = "";
     let loading = false;
@@ -9,6 +15,35 @@
 
     // Use relative path since we proxy through SvelteKit server
     const API_URL = "/api";
+
+    function formatDate(iso) {
+        const d = new Date(iso);
+        if (isNaN(d.getTime())) return iso;
+        return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
+            + " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    }
+
+    async function loadInbox(reset = true) {
+        if (reset) {
+            offset = 0;
+            emails = [];
+        }
+        mode = "inbox";
+        loading = true;
+        try {
+            const res = await fetch(`${API_URL}/messages?offset=${offset}&limit=100`);
+            const data = await res.json();
+            emails = reset ? data : emails.concat(data);
+            offset += data.length;
+            hasMore = data.length === 100;
+        } catch (e) {
+            console.error(e);
+        } finally {
+            loading = false;
+        }
+    }
+
+    onMount(() => loadInbox());
 
     async function scanMbox() {
         scanning = true;
@@ -35,11 +70,20 @@
     }
 
     async function search() {
+        const trimmed = query.trim();
+        if (!trimmed) {
+            return loadInbox();
+        }
         loading = true;
+        mode = "search";
         emails = [];
         selectedEmail = null;
         try {
-            const res = await fetch(`${API_URL}/search?q=${encodeURIComponent(query)}`);
+            let q = trimmed;
+            if (searchBodies && !trimmed.includes(':') && !trimmed.includes('"')) {
+                q = trimmed.split(/\s+/).map(w => `body:${w}`).join(' ');
+            }
+            const res = await fetch(`${API_URL}/search?q=${encodeURIComponent(q)}`);
             emails = await res.json();
         } catch (e) {
             console.error(e);
@@ -63,45 +107,65 @@
 <div class="container">
     <div class="sidebar">
         <h1>Mbox Browser</h1>
-        
+
         <div class="actions">
             <button on:click={mergeMbox} disabled={merging}>
                 {merging ? 'Merging...' : 'Merge Mbox Files'}
             </button>
             <button on:click={scanMbox} disabled={scanning}>
-                {scanning ? 'Scanning...' : 'Scan /data'}
+                {scanning ? 'Scanning...' : 'Re-scan /data'}
             </button>
         </div>
 
         <div class="search-box">
-            <input 
-                type="text" 
-                bind:value={query} 
-                placeholder="Search subject, body..." 
+            <input
+                type="text"
+                bind:value={query}
+                placeholder="Search subject/sender, or from:dave subject:x"
                 on:keydown={(e) => e.key === 'Enter' && search()}
             />
             <button on:click={search}>Search</button>
+            <label class="bodies">
+                <input type="checkbox" bind:checked={searchBodies} />
+                Include message bodies (full-archive scan, takes minutes)
+            </label>
         </div>
 
         <div class="email-list">
             {#if loading}
-                <div class="loading">Searching...</div>
+                <div class="loading">
+                    {mode === 'search' && searchBodies
+                        ? 'Scanning every message body — minutes on a large archive...'
+                        : 'Loading...'}
+                </div>
             {:else if emails.length === 0}
-                <div class="empty">No results</div>
+                {#if mode === 'search'}
+                    <div class="empty">
+                        No results.
+                        <button on:click={() => loadInbox()}>Back to inbox</button>
+                    </div>
+                {:else}
+                    <div class="empty">No emails indexed yet. Put .mbox files in data/ and click Re-scan.</div>
+                {/if}
             {:else}
                 {#each emails as email}
-                    <div 
-                        class="email-item" 
+                    <div
+                        class="email-item"
                         class:selected={selectedEmail && selectedEmail.id === email.id}
                         on:click={() => selectEmail(email)}
                     >
                         <div class="subject" title={email.subject}>{email.subject || '(No Subject)'}</div>
                         <div class="meta">
                             <span class="from" title={email.from}>{email.from}</span>
-                            <span class="date">{email.date}</span>
+                            <span class="date">{formatDate(email.date)}</span>
                         </div>
                     </div>
                 {/each}
+                {#if mode === 'inbox' && hasMore}
+                    <div class="load-more">
+                        <button on:click={() => loadInbox(false)}>Load 100 more</button>
+                    </div>
+                {/if}
             {/if}
         </div>
     </div>
@@ -112,13 +176,14 @@
                 <div class="header">
                     <h2>{selectedEmail.subject}</h2>
                     <p><strong>From:</strong> {selectedEmail.from}</p>
-                    <p><strong>Date:</strong> {selectedEmail.date}</p>
+                    <p><strong>Date:</strong> {formatDate(selectedEmail.date)}</p>
                 </div>
                 <div class="body">
                     {#if selectedEmailContent.trim().startsWith('<')}
-                        <iframe 
-                            srcdoc={selectedEmailContent} 
+                        <iframe
+                            srcdoc={selectedEmailContent}
                             title="Email content"
+                            sandbox="allow-popups"
                             style="width: 100%; height: 600px; border: 1px solid #ddd; background: white;"
                         ></iframe>
                     {:else}
@@ -170,11 +235,20 @@
     .search-box {
         padding: 0.5rem 1rem;
         display: flex;
+        flex-wrap: wrap;
         gap: 0.5rem;
     }
-    .search-box input {
+    .search-box input[type="text"] {
         flex: 1;
         padding: 0.4rem;
+    }
+    .bodies {
+        font-size: 0.75rem;
+        color: #555;
+        display: flex;
+        align-items: center;
+        gap: 0.3rem;
+        flex-basis: 100%;
     }
     .email-list {
         flex: 1;
@@ -244,5 +318,17 @@
         padding: 2rem;
         text-align: center;
         color: #666;
+    }
+    .empty button {
+        margin-left: 0.5rem;
+        cursor: pointer;
+    }
+    .load-more {
+        padding: 1rem;
+        text-align: center;
+    }
+    .load-more button {
+        padding: 0.5rem 1rem;
+        cursor: pointer;
     }
 </style>

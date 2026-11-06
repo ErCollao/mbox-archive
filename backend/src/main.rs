@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -7,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    path::{Path as StdPath, PathBuf},
+    path::PathBuf,
     sync::{Arc, RwLock},
 };
 use mboxshell::model::mail::MailEntry;
@@ -16,7 +17,7 @@ use mboxshell::search;
 use mboxshell::store::reader::MboxStore;
 use tower_http::cors::CorsLayer;
 use walkdir::WalkDir;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 #[derive(Clone)]
 struct AppState {
@@ -27,11 +28,18 @@ struct AppState {
 struct AppStateInner {
     mbox_path: Option<PathBuf>,
     entries: Vec<MailEntry>,
+    order: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct SearchQuery {
     q: String,
+}
+
+#[derive(Deserialize)]
+struct ListQuery {
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -43,6 +51,17 @@ struct EmailMetadata {
     snippet: String,
 }
 
+fn metadata_for(inner: &AppStateInner, idx: usize) -> EmailMetadata {
+    let entry = &inner.entries[idx];
+    EmailMetadata {
+        id: idx.to_string(),
+        subject: entry.subject.clone(),
+        from: format!("{} <{}>", entry.from.display_name, entry.from.address),
+        date: entry.date.to_rfc3339(),
+        snippet: String::new(),
+    }
+}
+
 #[derive(Serialize)]
 struct ScanResponse {
     message: String,
@@ -51,7 +70,13 @@ struct ScanResponse {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // Bare fmt::init() + env-filter feature = silent when RUST_LOG is unset; default to info.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let data_dir = PathBuf::from("/data");
     fs::create_dir_all(&data_dir).unwrap();
@@ -60,13 +85,21 @@ async fn main() {
         inner: Arc::new(RwLock::new(AppStateInner {
             mbox_path: None,
             entries: Vec::new(),
+            order: Vec::new(),
         })),
         data_dir,
     };
 
+    // Auto-load the persistent index on boot so browsing works immediately.
+    {
+        let s = state.clone();
+        tokio::spawn(async move { scan_handler(State(s)).await; });
+    }
+
     let app = Router::new()
         .route("/api/scan", post(scan_handler))
         .route("/api/merge", post(merge_handler))
+        .route("/api/messages", get(list_messages))
         .route("/api/search", get(search_handler))
         .route("/api/email/:id", get(get_email_content))
         .layer(CorsLayer::permissive())
@@ -101,6 +134,7 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
             &mbox_files,
             &output,
             true, // dedup
+            false, // add_source_header
             &|curr, total, name| {
                 info!("Merging file {}/{}: {}", curr, total, name);
             }
@@ -147,8 +181,11 @@ async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
         info!("Indexing: {:?}", target_path);
         match builder::build_index(&target_path, false, None) {
             Ok(entries) => {
+                let mut order: Vec<usize> = (0..entries.len()).collect();
+                order.sort_by(|&a, &b| entries[b].date.cmp(&entries[a].date));
                 let mut lock = inner.write().unwrap();
                 lock.mbox_path = Some(target_path);
+                lock.order = order;
                 lock.entries = entries;
                 info!("Indexing complete. Total messages: {}", lock.entries.len());
             }
@@ -162,37 +199,78 @@ async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     })
 }
 
+async fn list_messages(
+    State(state): State<AppState>,
+    Query(params): Query<ListQuery>,
+) -> Json<Vec<EmailMetadata>> {
+    let inner = state.inner.clone();
+    let items = tokio::task::spawn_blocking(move || {
+        let lock = inner.read().unwrap();
+        let offset = params.offset.unwrap_or(0);
+        let limit = params.limit.unwrap_or(100).clamp(1, 500);
+        match lock.order.get(offset..) {
+            Some(slice) => slice.iter().take(limit).map(|&idx| metadata_for(&lock, idx)).collect(),
+            None => Vec::new(),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Vec::new());
+
+    Json(items)
+}
+
+/// Plain words (no field syntax) search headers only, keeping search instant
+/// on multi-GB archives. Body content requires explicit `body:` terms.
+fn default_metadata_query(q: &str) -> String {
+    if q.contains(':') || q.contains('"') {
+        return q.to_string();
+    }
+    q.split_whitespace()
+        .map(|t| format!("subject:{t} OR from:{t} OR to:{t}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 async fn search_handler(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
 ) -> Json<Vec<EmailMetadata>> {
-    let lock = state.inner.read().unwrap();
-    let mbox_path = match &lock.mbox_path {
-        Some(p) => p,
-        None => return Json(vec![]),
-    };
-    
-    if params.q.trim().is_empty() {
-        return Json(vec![]);
-    }
-
-    match search::execute(mbox_path, &lock.entries, &params.q, None) {
-        Ok((_, results)) => {
-            let mut items = Vec::new();
-            for &idx in results.iter().take(50) {
-                let entry = &lock.entries[idx];
-                items.push(EmailMetadata {
-                    id: idx.to_string(),
-                    subject: entry.subject.clone(),
-                    from: format!("{} <{}>", entry.from.display_name, entry.from.address),
-                    date: entry.date.to_rfc3339(),
-                    snippet: "".to_string(),
-                });
-            }
-            Json(items)
+    let inner = state.inner.clone();
+    let q = params.q;
+    // The body-scan path can run for minutes on large archives: keep it off
+    // the async runtime and make its progress visible in the logs.
+    let items = tokio::task::spawn_blocking(move || {
+        let lock = inner.read().unwrap();
+        let mbox_path = match &lock.mbox_path {
+            Some(p) => p.clone(),
+            None => return Vec::new(),
+        };
+        if q.trim().is_empty() {
+            return Vec::new();
         }
-        Err(_) => Json(vec![]),
-    }
+        let q = default_metadata_query(&q);
+        let progress = |processed: usize, total: usize| {
+            if processed > 0 && processed % 5000 == 0 {
+                info!("Body search progress: {}/{} messages", processed, total);
+            }
+            true
+        };
+        match search::execute(&mbox_path, &lock.entries, &q, Some(&progress)) {
+            Ok((_, results)) => results
+                .iter()
+                .take(50)
+                .map(|&idx| metadata_for(&lock, idx))
+                .collect(),
+            Err(e) => {
+                warn!("Search failed: {}", e);
+                Vec::new()
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Vec::new());
+
+    Json(items)
 }
 
 async fn get_email_content(
@@ -224,7 +302,11 @@ async fn get_email_content(
         Ok(body) => {
             // Prefer HTML if available, otherwise Text
             if let Some(html) = &body.html {
-                axum::response::Html(html.clone()).into_response()
+                // Untrusted email HTML: isolate it from this origin
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+                headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+                return (headers, axum::response::Html(html.clone())).into_response();
             } else if let Some(text) = &body.text {
                 text.clone().into_response()
             } else {
