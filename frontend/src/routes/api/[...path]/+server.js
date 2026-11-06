@@ -9,13 +9,14 @@ const BACKEND_URL = env.BACKEND_URL || 'http://backend:3000';
  */
 function forwarded(response) {
     const headers = new Headers();
-    for (const key of ['content-type', 'content-security-policy', 'x-content-type-options']) {
+    for (const key of ['content-type', 'content-disposition', 'content-security-policy', 'x-content-type-options']) {
         const value = response.headers.get(key);
         if (value) headers.set(key, value);
     }
-    if (!headers.has('content-type')) headers.set('content-type', 'application/json');
     return headers;
 }
+
+const TEXT_TYPES = /json|text|html|xml|javascript/;
 
 /** @type {import('./$types').RequestHandler} */
 export async function GET({ params, url }) {
@@ -25,8 +26,15 @@ export async function GET({ params, url }) {
         if (!response.ok) {
             throw error(response.status, await response.text());
         }
+        const headers = forwarded(response);
+        const contentType = (response.headers.get('content-type') || '').toLowerCase();
+        // Binary payloads (attachment images/files) must be streamed, not re-encoded as text.
+        if (!TEXT_TYPES.test(contentType) && response.body) {
+            return new Response(response.body, { headers });
+        }
         const data = await response.text();
-        return new Response(data, { headers: forwarded(response) });
+        if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+        return new Response(data, { headers });
     } catch (e) {
         console.error('Proxy GET error:', e);
         throw error(500, 'Backend unavailable');
