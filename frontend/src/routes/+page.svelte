@@ -22,6 +22,7 @@
     let loading = false;
     let scanning = false;
     let merging = false;
+    let expanded = false;
 
     // Use relative path since we proxy through SvelteKit server
     const API_URL = "/api";
@@ -213,8 +214,8 @@
     }
 </script>
 
-<div class="container">
-    <div class="sidebar">
+<div class="container" class:email-expanded={expanded}>
+    <aside class="pane pane-settings">
         <h1>Mbox Browser</h1>
 
         <div class="search-box">
@@ -270,8 +271,32 @@
                 Has attachments
             </label>
             {#if anyFilter() || query}
-                <button class="clear" on:click={clearFilters}>Clear filters</button>
+                <button class="clear" on:click={clearFilters}>Clear</button>
             {/if}
+        </div>
+
+        <div class="actions">
+            <button on:click={mergeMbox} disabled={merging}>
+                {merging ? 'Merging...' : 'Merge Mbox Files'}
+            </button>
+            <button on:click={scanMbox} disabled={scanning}>
+                {scanning ? 'Scanning...' : 'Re-scan /data'}
+            </button>
+        </div>
+    </aside>
+
+    <section class="pane pane-results">
+        <div class="list-head">
+            <span>
+                {#if loading}
+                    Searching...
+                {:else if mode === 'search'}
+                    {emails.length} match{emails.length === 1 ? '' : 'es'}{emails.length === 50 ? ' (most recent shown)' : ''}
+                {:else}
+                    Inbox
+                {/if}
+            </span>
+            <span class="order">newest first</span>
         </div>
 
         <div class="email-list">
@@ -311,19 +336,15 @@
                 {/if}
             {/if}
         </div>
+    </section>
 
-        <div class="actions">
-            <button on:click={mergeMbox} disabled={merging}>
-                {merging ? 'Merging...' : 'Merge Mbox Files'}
-            </button>
-            <button on:click={scanMbox} disabled={scanning}>
-                {scanning ? 'Scanning...' : 'Re-scan /data'}
-            </button>
-        </div>
-    </div>
-
-    <div class="main">
+    <section class="pane pane-email">
         {#if selectedEmail}
+            <div class="email-tools">
+                <button on:click={() => expanded = !expanded}>
+                    {expanded ? 'Restore' : 'Full screen'}
+                </button>
+            </div>
             <div class="email-view">
                 <div class="header">
                     <h2>{selectedEmail.subject}</h2>
@@ -364,7 +385,6 @@
                             srcdoc={selectedEmailContent}
                             title="Email content"
                             sandbox="allow-popups"
-                            style="width: 100%; height: 600px; border: 1px solid #ddd; background: white;"
                         ></iframe>
                     {:else}
                         <pre>{selectedEmailContent}</pre>
@@ -376,7 +396,7 @@
                 Select an email to view
             </div>
         {/if}
-    </div>
+    </section>
 </div>
 
 <style>
@@ -387,27 +407,66 @@
         overflow: hidden;
     }
     .container {
-        display: flex;
+        display: grid;
+        grid-template-columns: 270px minmax(360px, 440px) 1fr;
         height: 100vh;
     }
-    .sidebar {
-        width: 350px;
-        background: #f7f7f7;
+    .container.email-expanded {
+        grid-template-columns: 1fr;
+    }
+    .email-expanded .pane-settings,
+    .email-expanded .pane-results {
+        display: none;
+    }
+    .pane {
+        height: 100vh;
+        overflow-y: auto;
+    }
+    .pane-settings {
+        background: #f2f2f2;
         border-right: 1px solid #ddd;
         display: flex;
         flex-direction: column;
     }
-    .sidebar h1 {
+    .pane-settings h1 {
         padding: 1rem;
         margin: 0;
-        font-size: 1.2rem;
+        font-size: 1.1rem;
+    }
+    .pane-results {
+        background: #f7f7f7;
+        border-right: 1px solid #ddd;
+        display: flex;
+        flex-direction: column;
+        height: 100vh;
+    }
+    .list-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 0.7rem 1rem;
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: #444;
+        border-bottom: 1px solid #ddd;
+        background: white;
+        position: sticky;
+        top: 0;
+    }
+    .list-head .order {
+        font-weight: normal;
+        color: #999;
+        font-size: 0.72rem;
+    }
+    .pane-email {
+        background: white;
     }
     .actions {
-        padding: 0.5rem 1rem;
+        padding: 0.5rem 1rem 1rem;
         display: flex;
         flex-direction: column;
         gap: 0.5rem;
-        border-top: 1px solid #ddd;
+        margin-top: auto;
     }
     .actions button {
         padding: 0.5rem;
@@ -421,6 +480,7 @@
     }
     .search-box input[type="text"] {
         flex: 1;
+        min-width: 0;
         padding: 0.4rem;
     }
     .bodies {
@@ -432,12 +492,13 @@
         flex-basis: 100%;
     }
     .labels {
-        margin: 0 1rem 0.4rem;
-        max-height: 170px;
+        margin: 0 1rem 0.5rem;
+        max-height: 220px;
         overflow-y: auto;
         border: 1px solid #e2e2e2;
         border-radius: 4px;
         background: white;
+        flex-shrink: 0;
     }
     .label-item {
         display: flex;
@@ -478,11 +539,6 @@
         border-radius: 10px;
         background: white;
         cursor: pointer;
-    }
-    .chip.on {
-        background: #333;
-        color: white;
-        border-color: #333;
     }
     .chip.sm {
         cursor: default;
@@ -573,6 +629,7 @@
         border-bottom: 1px solid #eee;
         cursor: pointer;
         overflow: hidden;
+        background: white;
     }
     .email-item:hover {
         background: #eee;
@@ -604,10 +661,20 @@
     .date {
         white-space: nowrap;
     }
-    .main {
-        flex: 1;
-        overflow-y: auto;
-        padding: 2rem;
+    .email-view {
+        padding: 1.5rem 2rem;
+    }
+    .email-tools {
+        display: flex;
+        justify-content: flex-end;
+        padding: 0.6rem 1rem 0;
+    }
+    .email-tools button {
+        font-size: 0.75rem;
+        padding: 0.25rem 0.8rem;
+        cursor: pointer;
+        border: 1px solid #bbb;
+        border-radius: 4px;
         background: white;
     }
     .email-view .header {
@@ -622,6 +689,16 @@
         padding: 1rem;
         border-radius: 4px;
         font-size: 0.9rem;
+    }
+    .body iframe {
+        width: 100%;
+        height: calc(100vh - 340px);
+        min-height: 420px;
+        border: 1px solid #ddd;
+        background: white;
+    }
+    .email-expanded .body iframe {
+        height: calc(100vh - 220px);
     }
     .attachments {
         border: 1px solid #ddd;
