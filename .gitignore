@@ -3,3 +3,4 @@ backend/target
 frontend/.svelte-kit
 frontend/build
 data/
+testdata/

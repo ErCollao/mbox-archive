@@ -11,6 +11,8 @@ use mboxshell::model::mail::MailEntry;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{BufWriter, Write};
+use std::time::SystemTime;
 use std::{
     fs,
     path::PathBuf,
@@ -41,18 +43,22 @@ struct Facets {
     labels: Vec<(String, u64)>,
     min_ts: i64,
     max_ts: i64,
+    total: u64,
 }
 
 impl Default for Facets {
     fn default() -> Self {
-        Facets { labels: Vec::new(), min_ts: 0, max_ts: 0 }
+        Facets { labels: Vec::new(), min_ts: 0, max_ts: 0, total: 0 }
     }
 }
 
 #[derive(Deserialize)]
 struct FilterParams {
     q: Option<String>,
-    label: Option<String>,
+    top: Option<String>,
+    cat: Option<String>,
+    status: Option<String>,
+    other: Option<String>,
     after: Option<String>,
     before: Option<String>,
     attachment: Option<String>,
@@ -118,10 +124,10 @@ fn parse_bound(s: &Option<String>) -> Option<DateTime<Utc>> {
         .map(|n| Utc.from_utc_datetime(&n))
 }
 
-fn label_selection(csv: &Option<String>) -> Vec<String> {
-    csv.as_deref()
-        .map(|s| {
-            s.split(',')
+fn csv_labels(s: &Option<String>) -> Vec<String> {
+    s.as_deref()
+        .map(|v| {
+            v.split(',')
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
                 .collect()
@@ -129,32 +135,92 @@ fn label_selection(csv: &Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn entry_in_filters(
-    entry: &MailEntry,
-    labels: &[String],
-    after: &Option<DateTime<Utc>>,
-    before: &Option<DateTime<Utc>>,
-    want_attachment: bool,
-) -> bool {
-    if !labels.is_empty()
-        && !labels.iter().any(|sel| {
-            entry.labels.iter().any(|l| l.eq_ignore_ascii_case(sel))
-        })
-    {
+#[derive(Default)]
+struct Sel {
+    top: Option<String>,
+    cat: Option<String>,
+    status: Vec<String>,
+    other: Vec<String>,
+}
+
+fn parse_sel(p: &FilterParams) -> Sel {
+    Sel {
+        top: p.top.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        cat: p.cat.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        status: csv_labels(&p.status),
+        other: csv_labels(&p.other),
+    }
+}
+
+fn has_lbl(e: &MailEntry, l: &str) -> bool {
+    e.labels.iter().any(|x| x.eq_ignore_ascii_case(l))
+}
+
+const TOP_LABELS: [&str; 2] = ["Inbox", "Important"];
+const STATUS_LABELS: [&str; 8] = ["Unread", "Opened", "Archived", "Starred", "Sent", "Drafts", "Spam", "Trash"];
+/// Real Gmail inbox tabs. "Category Bills/Purchases/Travel/…" are auto-detected
+/// labels, not tabs: they live in the `other` group.
+const CATEGORY_TABS: [&str; 6] = [
+    "Category Personal",
+    "Category Social",
+    "Category Updates",
+    "Category Forums",
+    "Category Reservations",
+    "Category Promotions",
+];
+
+/// 0=top, 1=category, 2=status, 3=other. Frontend mirrors these constants.
+fn group_of(l: &str) -> u8 {
+    let l = l.to_lowercase();
+    if TOP_LABELS.iter().any(|t| t.to_lowercase() == l) {
+        0
+    } else if CATEGORY_TABS.iter().any(|c| c.to_lowercase() == l) {
+        1
+    } else if STATUS_LABELS.iter().any(|s| s.to_lowercase() == l) {
+        2
+    } else {
+        3
+    }
+}
+
+/// Whether the entry satisfies the selection, optionally skipping one group
+/// (for per-group facet counts). Multiple values inside a toggle group are OR.
+fn sel_ok(e: &MailEntry, s: &Sel, skip: u8) -> bool {
+    if skip != 0 {
+        if let Some(l) = &s.top {
+            if !has_lbl(e, l) {
+                return false;
+            }
+        }
+    }
+    if skip != 1 {
+        if let Some(l) = &s.cat {
+            if !has_lbl(e, l) {
+                return false;
+            }
+        }
+    }
+    if skip != 2 && !s.status.is_empty() && !s.status.iter().any(|l| has_lbl(e, l)) {
         return false;
     }
+    if skip != 3 && !s.other.is_empty() && !s.other.iter().any(|l| has_lbl(e, l)) {
+        return false;
+    }
+    true
+}
+
+fn date_att_ok(e: &MailEntry, after: &Option<DateTime<Utc>>, before: &Option<DateTime<Utc>>, att: bool) -> bool {
     if let Some(a) = after {
-        if entry.date < *a {
+        if e.date < *a {
             return false;
         }
     }
-    // `before:` excludes the given day, matching mboxshell semantics.
     if let Some(b) = before {
-        if entry.date >= *b {
+        if e.date >= *b {
             return false;
         }
     }
-    if want_attachment && !entry.has_attachments {
+    if att && !e.has_attachments {
         return false;
     }
     true
@@ -189,15 +255,20 @@ fn compose_query(p: &FilterParams) -> String {
         }
     }
 
-    let labels = label_selection(&p.label);
-    if !labels.is_empty() {
-        parts.push(
-            labels
-                .iter()
-                .map(|l| format!("label:\"{}\"", l.replace('"', "")))
-                .collect::<Vec<_>>()
-                .join(" OR "),
-        );
+    let s = parse_sel(p);
+    let qterm = |l: &String| format!("label:\"{}\"", l.replace('"', ""));
+    if let Some(l) = &s.top {
+        parts.push(qterm(l));
+    }
+    if let Some(l) = &s.cat {
+        parts.push(qterm(l));
+    }
+    // Values inside a toggle group are OR; groups combine by AND (juxtaposition).
+    if !s.status.is_empty() {
+        parts.push(s.status.iter().map(qterm).collect::<Vec<_>>().join(" OR "));
+    }
+    if !s.other.is_empty() {
+        parts.push(s.other.iter().map(qterm).collect::<Vec<_>>().join(" OR "));
     }
     if p.attachment.as_deref() == Some("1") {
         parts.push("has:attachment".to_string());
@@ -237,6 +308,7 @@ fn compute_facets(entries: &[MailEntry]) -> Facets {
         labels,
         min_ts: min.map(|d| d.timestamp_millis()).unwrap_or(0),
         max_ts: max.map(|d| d.timestamp_millis()).unwrap_or(0),
+        total: entries.len() as u64,
     }
 }
 
@@ -305,7 +377,7 @@ async fn main() {
     // Auto-load the persistent index on boot so browsing works immediately.
     {
         let s = state.clone();
-        tokio::spawn(async move { scan_handler(State(s)).await; });
+        tokio::spawn(async move { let _ = scan_handler(State(s)).await; });
     }
 
     let app = Router::new()
@@ -329,35 +401,111 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     let data_dir = state.data_dir.clone();
 
     tokio::task::spawn_blocking(move || {
-        let mut mbox_files = Vec::new();
+        let mut mbox_files: Vec<(PathBuf, SystemTime)> = Vec::new();
         for entry in WalkDir::new(&data_dir).into_iter().filter_map(|e| e.ok()) {
-            if entry.path().extension().map_or(false, |ext| ext == "mbox") {
-                if entry.file_name() != "merged.mbox" {
-                    mbox_files.push(entry.path().to_path_buf());
+            if entry.path().extension().map_or(false, |ext| ext == "mbox")
+                && entry.file_name() != "merged.mbox"
+            {
+                let mt = entry
+                    .metadata()
+                    .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                mbox_files.push((entry.path().to_path_buf(), mt));
+            }
+        }
+        if mbox_files.is_empty() {
+            return;
+        }
+
+        // Oldest-first output; the newest export owns each Message-ID. This
+        // dedups across Takeout generations, where byte-identical hashing
+        // fails because exported headers (X-Gmail-Labels) drift over time.
+        mbox_files.sort_by_key(|(_, mt)| *mt);
+        let mut indexes: Vec<Vec<MailEntry>> = Vec::new();
+        for (p, _) in &mbox_files {
+            match builder::build_index(p, false, None) {
+                Ok(e) => indexes.push(e),
+                Err(err) => {
+                    error!("Merge aborted, indexing {:?}: {}", p, err);
+                    return;
+                }
+            }
+        }
+        let mut owner: HashMap<String, usize> = HashMap::new();
+        for (fidx, entries) in indexes.iter().enumerate().rev() {
+            for e in entries {
+                if !e.message_id.is_empty() {
+                    owner.entry(e.message_id.clone()).or_insert(fidx);
                 }
             }
         }
 
-        if mbox_files.is_empty() {
-             return;
-        }
-
         let output = data_dir.join("merged.mbox");
+        let tmp = data_dir.join("merged.mbox.tmp");
         info!("Merging {} files into {:?}", mbox_files.len(), output);
-
-        let res = mboxshell::export::mbox::merge_mbox_files(
-            &mbox_files,
-            &output,
-            true, // dedup
-            false, // add_source_header
-            &|curr, total, name| {
-                info!("Merging file {}/{}: {}", curr, total, name);
+        let mut out = match fs::File::create(&tmp) {
+            Ok(f) => BufWriter::with_capacity(1 << 20, f),
+            Err(e) => {
+                error!("Merge aborted, creating {:?}: {}", tmp, e);
+                return;
             }
-        );
-
-        match res {
-            Ok(stats) => info!("Merge complete: {:?}", stats),
-            Err(e) => error!("Merge failed: {}", e),
+        };
+        let mut kept = 0u64;
+        let mut dups = 0u64;
+        let mut prev_ended_nl = true;
+        for (fidx, (path, _)) in mbox_files.iter().enumerate() {
+            let mut store = match MboxStore::open(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Merge aborted, opening {:?}: {}", path, e);
+                    drop(out);
+                    let _ = fs::remove_file(&tmp);
+                    return;
+                }
+            };
+            let entries = &indexes[fidx];
+            for (i, entry) in entries.iter().enumerate() {
+                if i > 0 && i % 50_000 == 0 {
+                    info!("Merging {:?}: {}/{}", path.file_name().unwrap_or_default(), i, entries.len());
+                }
+                if !entry.message_id.is_empty()
+                    && owner.get(&entry.message_id).map_or(false, |o| *o != fidx)
+                {
+                    dups += 1;
+                    continue;
+                }
+                let raw = match store.get_raw_message(entry) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Merge aborted, reading message: {}", e);
+                        drop(out);
+                        let _ = fs::remove_file(&tmp);
+                        return;
+                    }
+                };
+                if kept > 0 && !prev_ended_nl {
+                    // Ensure the next `From ` line starts fresh after a blank line.
+                    let _ = out.write_all(b"\n");
+                }
+                let _ = out.write_all(&raw);
+                prev_ended_nl = raw.last() == Some(&b'\n');
+                kept += 1;
+            }
+        }
+        let finish = |mut out: BufWriter<fs::File>| -> std::io::Result<()> {
+            out.flush()?;
+            let mut file = out
+                .into_inner()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            file.flush()?;
+            fs::rename(&tmp, &output)
+        };
+        match finish(out) {
+            Ok(()) => info!("Merge complete: kept {} messages, skipped {} older duplicates", kept, dups),
+            Err(e) => {
+                error!("Merge aborted on write: {}", e);
+                let _ = fs::remove_file(&tmp);
+            }
         }
     });
 
@@ -416,8 +564,66 @@ async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     })
 }
 
-async fn filters_handler(State(state): State<AppState>) -> Json<Facets> {
-    let facets = state.inner.read().unwrap().facets.clone();
+async fn filters_handler(
+    State(state): State<AppState>,
+    Query(params): Query<FilterParams>,
+) -> Json<Facets> {
+    let inner = state.inner.clone();
+    let fallback = state.inner.read().unwrap().facets.clone();
+    let facets = tokio::task::spawn_blocking(move || {
+        let lock = inner.read().unwrap();
+        let base = &lock.facets;
+        let s = parse_sel(&params);
+        let after = parse_bound(&params.after);
+        let before = parse_bound(&params.before);
+        let att = params.attachment.as_deref() == Some("1");
+        let any = s.top.is_some()
+            || s.cat.is_some()
+            || !s.status.is_empty()
+            || !s.other.is_empty()
+            || after.is_some()
+            || before.is_some()
+            || att;
+        if !any {
+            return base.clone();
+        }
+        // Per-group facet counts: each group's labels are counted under all
+        // *other* active filters, so a selection never zeroes its own group.
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for e in &lock.entries {
+            if !date_att_ok(e, &after, &before, att) {
+                continue;
+            }
+            let a = sel_ok(e, &s, 0);
+            let b = sel_ok(e, &s, 1);
+            let c = sel_ok(e, &s, 2);
+            let d = sel_ok(e, &s, 3);
+            for l in &e.labels {
+                // A label is counted under every filter except its own group's.
+                let inc = match group_of(l) {
+                    0 => a,
+                    1 => b,
+                    2 => c,
+                    _ => d,
+                };
+                if inc {
+                    *counts.entry(l.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut labels: Vec<(String, u64)> = counts.into_iter().collect();
+        labels.sort_unstable_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+        labels.truncate(200);
+        Facets {
+            labels,
+            min_ts: base.min_ts,
+            max_ts: base.max_ts,
+            total: base.total,
+        }
+    })
+    .await
+    .unwrap_or(fallback);
+
     Json(facets)
 }
 
@@ -430,11 +636,14 @@ async fn list_messages(
         let lock = inner.read().unwrap();
         let offset = params.offset.unwrap_or(0);
         let limit = params.limit.unwrap_or(100).clamp(1, 500);
-        let labels = label_selection(&params.label);
+        let s = parse_sel(&params);
         let after = parse_bound(&params.after);
         let before = parse_bound(&params.before);
         let want_att = params.attachment.as_deref() == Some("1");
-        let filtered = !labels.is_empty()
+        let filtered = s.top.is_some()
+            || s.cat.is_some()
+            || !s.status.is_empty()
+            || !s.other.is_empty()
             || after.is_some()
             || before.is_some()
             || want_att;
@@ -453,7 +662,8 @@ async fn list_messages(
         let mut out = Vec::new();
         let mut skipped = 0usize;
         for &idx in &lock.order {
-            if !entry_in_filters(&lock.entries[idx], &labels, &after, &before, want_att) {
+            let entry = &lock.entries[idx];
+            if !sel_ok(entry, &s, 4) || !date_att_ok(entry, &after, &before, want_att) {
                 continue;
             }
             if skipped < offset {
