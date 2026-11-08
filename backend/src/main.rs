@@ -74,6 +74,7 @@ struct EmailMetadata {
     from: String,
     date: String,
     snippet: String,
+    attachments: bool,
 }
 
 #[derive(Serialize)]
@@ -111,6 +112,7 @@ fn metadata_for(inner: &AppStateInner, idx: usize) -> EmailMetadata {
         from: format!("{} <{}>", entry.from.display_name, entry.from.address),
         date: entry.date.to_rfc3339(),
         snippet: String::new(),
+        attachments: entry.has_attachments,
     }
 }
 

@@ -139,6 +139,79 @@
         .filter(([n]) => STATUS.includes(n))
         .sort((a, b) => STATUS.indexOf(a[0]) - STATUS.indexOf(b[0]));
     $: otherItems = labels.filter(([n]) => !TOP.includes(n) && !STATUS.includes(n) && !isCatTab(n));
+
+    // Hierarchical custom labels ("Vault/Academia/…"): show top level only,
+    // parents-with-children first then leaves, alphabetical within each.
+    let expandedTree = {};
+
+    function buildTree(items) {
+        const roots = [];
+        const index = new Map();
+        for (const [full] of items) {
+            let siblings = roots;
+            let path = "";
+            for (const seg of full.split("/")) {
+                path = path ? `${path}/${seg}` : seg;
+                let node = index.get(path);
+                if (!node) {
+                    node = { seg, full: path, children: [] };
+                    index.set(path, node);
+                    siblings.push(node);
+                }
+                siblings = node.children;
+            }
+            // The exact path exists as a label itself (e.g. "Admin" plus "Admin/…").
+            index.get(full).self = true;
+        }
+        return roots;
+    }
+
+    function rollup(node) {
+        const pref = node.full + "/";
+        let sum = 0;
+        for (const [n, c] of labels) {
+            if (n === node.full || n.startsWith(pref)) sum += c;
+        }
+        return sum;
+    }
+
+    function orderNodes(nodes) {
+        const cmp = (a, b) => a.seg.localeCompare(b.seg);
+        return [
+            ...nodes.filter(n => n.children.length).sort(cmp),
+            ...nodes.filter(n => !n.children.length).sort(cmp)
+        ];
+    }
+
+    function flatten(nodes, depth, out, exp) {
+        for (const n of orderNodes(nodes)) {
+            out.push({
+                full: n.full,
+                seg: n.seg,
+                depth,
+                hasKids: n.children.length > 0,
+                self: !!n.self,
+                expanded: !!exp[n.full],
+                count: rollup(n)
+            });
+            if (n.children.length && exp[n.full]) flatten(n.children, depth + 1, out, exp);
+        }
+        return out;
+    }
+
+    $: otherRoots = orderNodes(buildTree(otherItems));
+    $: otherRows = (() => {
+        const visible = showAllLabels ? otherRoots : otherRoots.slice(0, 5);
+        // Statement-level read: Svelte does not track deps inside nested arrows.
+        const exp = expandedTree;
+        const out = [];
+        visible.forEach(n => flatten([n], 0, out, exp));
+        return out;
+    })();
+
+    function toggleExpand(full) {
+        expandedTree = { ...expandedTree, [full]: !expandedTree[full] };
+    }
     $: groups = [
         { head: null, field: "top", items: topItems },
         { head: "Categories", field: "cat", items: catItems },
@@ -408,24 +481,59 @@
                 {#each groups as g, i (String(g.head))}
                     <div class="label-group" class:top={i === 0}>
                         {#if g.head}<div class="nav-head">{g.head}</div>{/if}
-                        {#each (g.field === 'other' && !showAllLabels ? g.items.slice(0, 5) : g.items) as [name, count] (name)}
-                            {@const active = g.field === 'other' ? selOther.includes(name) : g.field === 'status' ? selStatus.includes(name) : sel[g.field] === name}
-                            <button
-                                class="label-item"
-                                class:on={active}
-                                style={active && isCatTab(name)
-                                    ? `background: ${withAlpha(CAT_TABS[name], 0.14)}; color: ${darken(CAT_TABS[name])}; border-left-color: ${CAT_TABS[name]};`
-                                    : undefined}
-                                on:click={() => pick(g.field, name)}
-                            >
-                                <span class="lname">{#if isCatTab(name)}<span class="cat-dot" style="background:{CAT_TABS[name]}"></span>{/if}{dispFor(name)}</span>
-                                <span class="count">{fmtCount(count)}</span>
-                            </button>
-                        {/each}
-                        {#if g.field === 'other' && g.items.length > 5}
-                            <button class="label-item show-more" on:click={() => showAllLabels = !showAllLabels}>
-                                <span class="lname">{showAllLabels ? 'Show fewer' : `Show all ${g.items.length} labels`}</span>
-                            </button>
+                        {#if g.field === 'other'}
+                            {#each otherRows as r (r.full)}
+                                {#if r.hasKids && r.self}
+                                    <div class="tree-row" style="padding-left: {r.depth * 0.85}rem;">
+                                        <button
+                                            class="twist-btn"
+                                            title={r.expanded ? 'Collapse' : 'Expand'}
+                                            on:click={() => toggleExpand(r.full)}
+                                        >{r.expanded ? '▾' : '▸'}</button>
+                                        <button
+                                            class="label-item inline"
+                                            class:on={selOther.includes(r.full)}
+                                            title={r.full}
+                                            on:click={() => pick('other', r.full)}
+                                        >
+                                            <span class="lname">{r.seg}</span>
+                                            <span class="count">{fmtCount(r.count)}</span>
+                                        </button>
+                                    </div>
+                                {:else}
+                                    <button
+                                        class="label-item tree"
+                                        class:parent={r.hasKids}
+                                        class:on={!r.hasKids && selOther.includes(r.full)}
+                                        style="padding-left: {0.7 + r.depth * 0.85}rem;"
+                                        title={r.hasKids ? (r.expanded ? 'Collapse' : 'Expand') : r.full}
+                                        on:click={() => r.hasKids ? toggleExpand(r.full) : pick('other', r.full)}
+                                    >
+                                        <span class="lname">{#if r.hasKids}<span class="twist">{r.expanded ? '▾' : '▸'}</span>{/if}{r.seg}</span>
+                                        <span class="count">{fmtCount(r.count)}</span>
+                                    </button>
+                                {/if}
+                            {/each}
+                            {#if otherRoots.length > 5}
+                                <button class="label-item show-more" on:click={() => showAllLabels = !showAllLabels}>
+                                    <span class="lname">{showAllLabels ? 'Show fewer' : `Show all ${otherRoots.length} labels`}</span>
+                                </button>
+                            {/if}
+                        {:else}
+                            {#each g.items as [name, count] (name)}
+                                {@const active = g.field === 'status' ? selStatus.includes(name) : sel[g.field] === name}
+                                <button
+                                    class="label-item"
+                                    class:on={active}
+                                    style={active && isCatTab(name)
+                                        ? `background: ${withAlpha(CAT_TABS[name], 0.14)}; color: ${darken(CAT_TABS[name])}; border-left-color: ${CAT_TABS[name]};`
+                                        : undefined}
+                                    on:click={() => pick(g.field, name)}
+                                >
+                                    <span class="lname">{#if isCatTab(name)}<span class="cat-dot" style="background:{CAT_TABS[name]}"></span>{/if}{dispFor(name)}</span>
+                                    <span class="count">{fmtCount(count)}</span>
+                                </button>
+                            {/each}
                         {/if}
                     </div>
                 {/each}
@@ -491,7 +599,7 @@
                         class:selected={selectedEmail && selectedEmail.id === email.id}
                         on:click={() => selectEmail(email)}
                     >
-                        <div class="subject" title={email.subject}>{email.subject || '(No Subject)'}</div>
+                        <div class="subject" title={email.subject}>{#if email.attachments}<span class="clip" title="Has attachments">📎</span>{/if}{email.subject || '(No Subject)'}</div>
                         <div class="meta">
                             <span class="from" title={email.from}>{email.from}</span>
                             <span class="date">{fmtDate(email.date)}</span>
@@ -803,6 +911,38 @@
         margin-right: 0.45rem;
         vertical-align: middle;
     }
+    .label-item.parent .lname {
+        font-weight: 600;
+        color: #333;
+    }
+    .twist {
+        display: inline-block;
+        width: 1rem;
+        color: #888;
+        font-size: 0.7rem;
+    }
+    .tree-row {
+        display: flex;
+        align-items: stretch;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .twist-btn {
+        border: none;
+        background: transparent;
+        color: #888;
+        font-size: 0.7rem;
+        padding: 0 0.3rem 0 0.55rem;
+        cursor: pointer;
+        align-self: center;
+    }
+    .twist-btn:hover {
+        color: #333;
+    }
+    .label-item.inline {
+        flex: 1;
+        border-bottom: none;
+        min-width: 0;
+    }
     .label-item.on {
         background: #d3e3fd;
         color: #1c3aa9;
@@ -938,6 +1078,11 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+    }
+    .clip {
+        font-size: 0.8rem;
+        margin-right: 0.35rem;
+        opacity: 0.75;
     }
     .meta {
         font-size: 0.8rem;
