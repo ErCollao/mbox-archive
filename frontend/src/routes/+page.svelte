@@ -10,7 +10,6 @@
     let selStatus = [];
     let selOther = [];
     let showAllLabels = false;
-    let facetsTotal = 0;
     let labels = [];
     let facetMin = 0;
     let facetMax = 0;
@@ -24,10 +23,7 @@
     let selectedEmailContent = "";
     let meta = null;
     let loading = false;
-    let scanning = false;
-    let merging = false;
     let expanded = false;
-    let showTools = false;
     let drawerOpen = false;
 
     // Use relative path since we proxy through SvelteKit server
@@ -316,7 +312,6 @@
             labels = f.labels;
             facetMin = f.min_ts;
             facetMax = f.max_ts;
-            facetsTotal = f.total;
             sliderLo = 0;
             sliderHi = totalDays();
         } catch (e) {
@@ -355,30 +350,6 @@
         if (names.includes("Category Personal")) sel = { ...sel, cat: "Category Personal" };
         loadInbox();
     });
-
-    async function scanMbox() {
-        scanning = true;
-        try {
-            await fetch(`${API_URL}/scan`, { method: 'POST' });
-            alert("Scan started! It may take a while for large files. Try searching in a minute.");
-        } catch (e) {
-            alert("Error starting scan: " + e.message);
-        } finally {
-            scanning = false;
-        }
-    }
-
-    async function mergeMbox() {
-        merging = true;
-        try {
-            await fetch(`${API_URL}/merge`, { method: 'POST' });
-            alert("Merge started: combines all .mbox files into merged.mbox, keeping the newest copy of each Message-ID (safe across re-exports with duplicates). When it finishes, run Re-scan.");
-        } catch (e) {
-            alert("Error starting merge: " + e.message);
-        } finally {
-            merging = false;
-        }
-    }
 
     async function search() {
         const trimmed = query.trim();
@@ -419,34 +390,17 @@
     }
 </script>
 
+<svelte:head>
+    <title>Mbox Archive</title>
+</svelte:head>
+<svelte:body class="app-shell" />
+
 <div class="container" class:email-expanded={expanded} class:drawer-open={drawerOpen}>
     <aside class="pane pane-settings">
         <div class="title-row">
-            <h1>Mbox Browser</h1>
-            <button
-                class="gear"
-                class:active={showTools}
-                title="Maintenance"
-                on:click={() => showTools = !showTools}
-            >⚙</button>
+            <h1>Mbox Archive</h1>
+            <a class="gear" href="/maintenance" title="Maintenance & backup">⚙</a>
         </div>
-        {#if showTools}
-            <div class="popover">
-                <button on:click={() => { showTools = false; mergeMbox(); }} disabled={merging}>
-                    {merging ? 'Merging...' : 'Merge Mbox Files'}
-                </button>
-                <button on:click={() => { showTools = false; scanMbox(); }} disabled={scanning}>
-                    {scanning ? 'Scanning...' : 'Re-scan /data'}
-                </button>
-                {#if facetsTotal > 0}
-                    <div class="pop-info">
-                        {facetsTotal.toLocaleString()} emails<br />
-                        latest: {fmtDate(facetMax)}<br />
-                        oldest: {fmtDate(facetMin)}
-                    </div>
-                {/if}
-            </div>
-        {/if}
 
         {#if facetMax > facetMin}
             <div class="dateslider">
@@ -685,6 +639,8 @@
     :global(body) {
         margin: 0;
         font-family: system-ui, -apple-system, sans-serif;
+    }
+    :global(body.app-shell) {
         height: 100vh;
         overflow: hidden;
     }
@@ -790,6 +746,8 @@
         padding: 1rem 1rem 0.4rem;
     }
     .gear {
+        text-decoration: none;
+        display: inline-block;
         border: none;
         background: transparent;
         font-size: 1.15rem;
@@ -800,34 +758,8 @@
         border-radius: 4px;
         color: #444;
     }
-    .gear:hover, .gear.active {
+    .gear:hover {
         background: #e2e2e2;
-    }
-    .popover {
-        position: absolute;
-        top: 2.9rem;
-        left: 0.7rem;
-        z-index: 40;
-        width: 200px;
-        background: white;
-        border: 1px solid #ccc;
-        border-radius: 6px;
-        box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
-        padding: 0.5rem;
-        display: flex;
-        flex-direction: column;
-        gap: 0.4rem;
-    }
-    .popover button {
-        padding: 0.45rem;
-        cursor: pointer;
-    }
-    .pop-info {
-        font-size: 0.72rem;
-        color: #555;
-        padding: 0.35rem 0.2rem 0;
-        border-top: 1px solid #eee;
-        line-height: 1.5;
     }
     .burger {
         display: none;

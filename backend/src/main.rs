@@ -6,12 +6,17 @@ use axum::{
     Router,
 };
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use mboxshell::model::attachment::AttachmentMeta;
 use mboxshell::model::mail::MailEntry;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::collections::HashMap;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::time::SystemTime;
 use std::{
     fs,
@@ -29,6 +34,17 @@ use tracing::{info, error, warn};
 struct AppState {
     inner: Arc<RwLock<AppStateInner>>,
     data_dir: PathBuf,
+    backup_dir: PathBuf,
+    busy: Arc<AtomicBool>,
+    backup: Arc<Mutex<BackupProgress>>,
+}
+
+#[derive(Serialize, Clone, Default)]
+struct BackupProgress {
+    running: bool,
+    phase: String,
+    done: u64,
+    total: u64,
 }
 
 struct AppStateInner {
@@ -81,6 +97,23 @@ struct EmailMetadata {
 struct ScanResponse {
     message: String,
     status: String,
+}
+
+/// Clears the shared busy flag on scope exit, however the task returns.
+struct BusyGuard(Arc<AtomicBool>);
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Ensures the backup progress UI never gets stuck on a stale state.
+struct BackupGuard(Arc<Mutex<BackupProgress>>);
+impl Drop for BackupGuard {
+    fn drop(&mut self) {
+        let mut p = self.0.lock().unwrap();
+        *p = BackupProgress::default();
+    }
 }
 
 #[derive(Serialize)]
@@ -365,6 +398,9 @@ async fn main() {
 
     let data_dir = PathBuf::from("/data");
     fs::create_dir_all(&data_dir).unwrap();
+    let backup_dir = PathBuf::from(
+        std::env::var("BACKUP_DIR").unwrap_or_else(|_| "/backup".to_string()),
+    );
 
     let state = AppState {
         inner: Arc::new(RwLock::new(AppStateInner {
@@ -374,6 +410,9 @@ async fn main() {
             facets: Facets::default(),
         })),
         data_dir,
+        backup_dir,
+        busy: Arc::new(AtomicBool::new(false)),
+        backup: Arc::new(Mutex::new(BackupProgress::default())),
     };
 
     // Auto-load the persistent index on boot so browsing works immediately.
@@ -391,6 +430,8 @@ async fn main() {
         .route("/api/email/:id", get(get_email_content))
         .route("/api/email/:id/meta", get(email_meta))
         .route("/api/attachment/:id/:part", get(get_attachment_data))
+        .route("/api/status", get(status_handler))
+        .route("/api/backup", post(backup_handler))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -401,13 +442,13 @@ async fn main() {
 
 async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     let data_dir = state.data_dir.clone();
+    state.busy.store(true, Ordering::SeqCst);
 
     tokio::task::spawn_blocking(move || {
+        let _busy = BusyGuard(state.busy.clone());
         let mut mbox_files: Vec<(PathBuf, SystemTime)> = Vec::new();
         for entry in WalkDir::new(&data_dir).into_iter().filter_map(|e| e.ok()) {
-            if entry.path().extension().map_or(false, |ext| ext == "mbox")
-                && entry.file_name() != "merged.mbox"
-            {
+            if entry.path().extension().map_or(false, |ext| ext == "mbox") {
                 let mt = entry
                     .metadata()
                     .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
@@ -415,6 +456,9 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
                 mbox_files.push((entry.path().to_path_buf(), mt));
             }
         }
+        // merged.mbox itself is a valid source: the archive accumulates
+        // in place, so raw exports can be deleted once merged. The output
+        // is written via .tmp + rename, so the input is never clobbered.
         if mbox_files.is_empty() {
             return;
         }
@@ -520,27 +564,38 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
 async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     let inner = state.inner.clone();
     let data_dir = state.data_dir.clone();
+    state.busy.store(true, Ordering::SeqCst);
 
     tokio::task::spawn_blocking(move || {
+        let _busy = BusyGuard(state.busy.clone());
         let merged_path = data_dir.join("merged.mbox");
         let target_path = if merged_path.exists() {
             merged_path
         } else {
-            // Fallback to the first mbox file found if merged doesn't exist
-            let mut first = None;
+            // No merged archive: index the newest mbox available and flag it
+            // loudly if several exist, since only one gets indexed.
+            let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
             for entry in WalkDir::new(&data_dir).into_iter().filter_map(|e| e.ok()) {
                  if entry.path().extension().map_or(false, |ext| ext == "mbox") {
-                     first = Some(entry.path().to_path_buf());
-                     break;
+                     let mt = entry
+                         .metadata()
+                         .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+                         .unwrap_or(SystemTime::UNIX_EPOCH);
+                     candidates.push((entry.path().to_path_buf(), mt));
                  }
             }
-            match first {
-                Some(p) => p,
-                None => {
-                    error!("No mbox files found to scan");
-                    return;
-                }
+            if candidates.is_empty() {
+                error!("No mbox files found to scan");
+                return;
             }
+            if candidates.len() > 1 {
+                warn!(
+                    "{} mbox files present but no merged.mbox — indexing only the newest; run Merge to combine them",
+                    candidates.len()
+                );
+            }
+            candidates.sort_by_key(|b| std::cmp::Reverse(b.1));
+            candidates.remove(0).0
         };
 
         info!("Indexing: {:?}", target_path);
@@ -867,5 +922,152 @@ async fn get_attachment_data(
             (headers, bytes).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Attachment not found").into_response(),
+    }
+}
+
+#[derive(Serialize)]
+struct StatusOut {
+    busy: bool,
+    source: Option<String>,
+    total: u64,
+    oldest_ts: i64,
+    latest_ts: i64,
+    backup: BackupProgress,
+}
+
+async fn status_handler(State(state): State<AppState>) -> Json<StatusOut> {
+    let lock = state.inner.read().unwrap();
+    Json(StatusOut {
+        busy: state.busy.load(Ordering::SeqCst),
+        source: lock
+            .mbox_path
+            .as_ref()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())),
+        total: lock.facets.total,
+        oldest_ts: lock.facets.min_ts,
+        latest_ts: lock.facets.max_ts,
+        backup: state.backup.lock().unwrap().clone(),
+    })
+}
+
+#[derive(Serialize)]
+struct BackupOut {
+    ok: bool,
+    message: String,
+    target: Option<String>,
+    bytes: Option<u64>,
+    secs: Option<u64>,
+}
+
+/// Safe copy of the current archive, gzip-compressed: written to a temp file
+/// with progress reporting, verified by full decompression, then atomically
+/// renamed — a partial or corrupt backup never appears as a completed one.
+async fn backup_handler(State(state): State<AppState>) -> Json<BackupOut> {
+    let fail = |m: String| {
+        Json(BackupOut {
+            ok: false,
+            message: m,
+            target: None,
+            bytes: None,
+            secs: None,
+        })
+    };
+
+    if state.busy.load(Ordering::SeqCst) {
+        return fail("A merge or scan is running — wait for it to finish, then back up.".to_string());
+    }
+    if state.backup.lock().unwrap().running {
+        return fail("A backup is already running.".to_string());
+    }
+    let src = state.inner.read().unwrap().mbox_path.clone();
+    let Some(src) = src else {
+        return fail("No archive is loaded — open the inbox (or press Re-scan) first.".to_string());
+    };
+    let backup_dir = state.backup_dir.clone();
+    let progress = state.backup.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, u64, u64), String> {
+        let _guard = BackupGuard(progress.clone());
+        let set = |phase: &str, done: u64, total: u64| {
+            let mut p = progress.lock().unwrap();
+            p.running = true;
+            p.phase = phase.to_string();
+            p.done = done;
+            p.total = total;
+        };
+
+        fs::create_dir_all(&backup_dir).map_err(|e| format!("cannot create backup dir {:?}: {}", backup_dir, e))?;
+        let name = format!("mbox-archive-{}.mbox.gz", Utc::now().format("%Y%m%d-%H%M%S"));
+        let target = backup_dir.join(&name);
+        let tmp = backup_dir.join(format!("{}.tmp", name));
+        let size = fs::metadata(&src).map_err(|e| format!("source unreadable: {}", e))?.len();
+        info!("Safe copy (gzip): {:?} ({} bytes) -> {:?}", src, size, target);
+        let start = std::time::Instant::now();
+
+        // Compression pass. The encoder is closed by scoping (Drop flushes);
+        // any residual error is caught by the verification pass below.
+        let mut rd = BufReader::with_capacity(1 << 20, fs::File::open(&src).map_err(|e| e.to_string())?);
+        let mut buf = vec![0u8; 4 << 20];
+        {
+            let mut enc = GzEncoder::new(
+                BufWriter::with_capacity(1 << 20, fs::File::create(&tmp).map_err(|e| e.to_string())?),
+                Compression::new(6),
+            );
+            let mut done = 0u64;
+            loop {
+                let n = rd.read(&mut buf).map_err(|e| format!("read failed: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                enc.write_all(&buf[..n]).map_err(|e| format!("write failed: {}", e))?;
+                done += n as u64;
+                set("compressing", done, size);
+            }
+            enc.try_finish().map_err(|e| format!("gzip finish failed: {}", e))?;
+        }
+        let mut to_sync = fs::File::open(&tmp).map_err(|e| e.to_string())?;
+        to_sync.sync_all().map_err(|e| e.to_string())?;
+
+        // Verification pass: the backup is only real if it decompresses
+        // back to the exact byte count of the source.
+        set("verifying", 0, size);
+        let mut dec = GzDecoder::new(BufReader::with_capacity(1 << 20, fs::File::open(&tmp).map_err(|e| e.to_string())?));
+        let mut count = 0u64;
+        loop {
+            let n = match dec.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            count += n as u64;
+            set("verifying", count, size);
+        }
+        if count != size {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!(
+                "verification failed: backup decompresses to {} of {} bytes — discarded",
+                count, size
+            ));
+        }
+
+        fs::rename(&tmp, &target).map_err(|e| format!("finalizing failed: {}", e))?;
+        let gz = fs::metadata(&target).map_err(|e| e.to_string())?.len();
+        Ok((
+            target.to_string_lossy().to_string(),
+            gz,
+            start.elapsed().as_secs(),
+        ))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((target, bytes, secs))) => Json(BackupOut {
+            ok: true,
+            message: "Backup complete (gzip, verified).".to_string(),
+            target: Some(target),
+            bytes: Some(bytes),
+            secs: Some(secs),
+        }),
+        Ok(Err(msg)) => fail(msg),
+        Err(_) => fail("Backup task was aborted.".to_string()),
     }
 }

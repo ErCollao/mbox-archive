@@ -9,7 +9,7 @@ const BACKEND_URL = env.BACKEND_URL || 'http://backend:3000';
  */
 function forwarded(response) {
     const headers = new Headers();
-    for (const key of ['content-type', 'content-disposition', 'content-security-policy', 'x-content-type-options']) {
+    for (const key of ['content-type', 'content-disposition', 'content-security-policy', 'x-content-type-options', 'cache-control']) {
         const value = response.headers.get(key);
         if (value) headers.set(key, value);
     }
@@ -34,6 +34,8 @@ export async function GET({ params, url }) {
         }
         const data = await response.text();
         if (!headers.has('content-type')) headers.set('content-type', 'application/json');
+        // Never let browsers cache live API data (indexes change behind the scenes).
+        if (!headers.has('cache-control')) headers.set('cache-control', 'no-store');
         return new Response(data, { headers });
     } catch (e) {
         console.error('Proxy GET error:', e);
