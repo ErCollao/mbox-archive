@@ -53,6 +53,30 @@ struct AppStateInner {
     entries: Vec<MailEntry>,
     order: Vec<usize>,
     facets: Facets,
+    threads: Vec<Thread>,
+    thread_order: Vec<usize>,
+    tmap: HashMap<String, usize>,
+}
+
+#[derive(Clone)]
+struct Thread {
+    tid: String,
+    msgs: Vec<usize>,
+    subject: String,
+    from: String,
+    date: DateTime<Utc>,
+    attachments: bool,
+}
+
+#[derive(Serialize)]
+struct ThreadOut {
+    tid: String,
+    subject: String,
+    from: String,
+    date: String,
+    count: usize,
+    matched: usize,
+    attachments: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -148,6 +172,131 @@ fn metadata_for(inner: &AppStateInner, idx: usize) -> EmailMetadata {
         attachments: entry.has_attachments,
     }
 }
+
+fn thread_out(t: &Thread, matched: usize) -> ThreadOut {
+    ThreadOut {
+        tid: t.tid.clone(),
+        subject: t.subject.clone(),
+        from: t.from.clone(),
+        date: t.date.to_rfc3339(),
+        count: t.msgs.len(),
+        matched,
+        attachments: t.attachments,
+    }
+}
+
+fn clean_subject(s: &str) -> String {
+    let re = match Regex::new(r"(?i)^(re|fw|fwd)(\[\d+\])?:\s*") {
+        Ok(r) => r,
+        Err(_) => return s.trim().to_string(),
+    };
+    let mut cur = s.trim().to_string();
+    while let Some(m) = re.find(&cur) {
+        let next = cur[m.end()..].trim().to_string();
+        if next.is_empty() {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+fn tid_of(entries: &[MailEntry], idx: usize) -> String {
+    match entries[idx].thread_id.as_deref() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => format!("solo-{}", idx),
+    }
+}
+
+/// Conversation-view rendering: fold quoted history into a native <details>,
+/// then sanitize for safe inline display. Scripts, event handlers and unsafe
+/// URLs are stripped; <style> is kept (shadow-DOM-scoped in the browser) so
+/// emails keep their intended look. Links get forced to new tabs.
+fn render_clean(html: &str) -> String {
+    let folded = fold_quotes(html);
+    let mut clean_content: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    clean_content.insert("script");
+    let out = ammonia::Builder::default()
+        .add_tags(&["details", "summary", "style"])
+        .add_generic_attributes(&["style"])
+        .clean_content_tags(clean_content)
+        .clean(&folded)
+        .to_string();
+    out.replace("<a href", "<a target=\"_blank\" rel=\"noreferrer noopener\" href")
+}
+
+/// Fold the quoted history of a reply into a collapsed native <details>.
+/// Gmail nests blockquotes (each reply wraps the previous whole thread), so we
+/// cut at the OUTERMOST quote marker. Both `<blockquote` and `gmail_quote` are
+/// needed as markers: forwarded/mobile copies of Gmail mail keep the blockquote
+/// but lose the class. To avoid misfolding newsletters that use blockquotes as
+/// design elements, a history header ("wrote:" in any locale) must sit right at
+/// the marker boundary, not merely somewhere later in the body.
+fn fold_quotes(html: &str) -> String {
+    let lower = html.to_lowercase();
+    if lower.len() < 400 {
+        return html.to_string();
+    }
+    let heads = ["wrote:", "escribi", "schreef", "ecrit", "schrieb", "scrive"];
+    let mut cut: Option<usize> = None;
+    for pat in ["<blockquote", "class=\"gmail_quote\""] {
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(pat) {
+            let i = from + rel;
+            from = i + 1;
+            if i <= 100 || i + 400 >= lower.len() {
+                continue;
+            }
+            let win = &lower[i.saturating_sub(600)..(i + 600).min(lower.len())];
+            if heads.iter().any(|h| win.contains(h)) {
+                cut = Some(cut.map_or(i, |c| c.min(i)));
+                break;
+            }
+        }
+    }
+    match cut {
+        Some(i) => format!(
+            "{}\n<details><summary>Show quoted text</summary>\n{}\n</details>",
+            &html[..i],
+            &html[i..]
+        ),
+        None => html.to_string(),
+    }
+}
+
+fn build_threads(entries: &[MailEntry]) -> (Vec<Thread>, Vec<usize>, HashMap<String, usize>) {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        groups.entry(tid_of(entries, i)).or_default().push(i);
+    }
+    let mut threads: Vec<Thread> = Vec::with_capacity(groups.len());
+    for (tid, mut msgs) in groups {
+        msgs.sort_by_key(|&i| entries[i].date);
+        let latest = *msgs.last().unwrap();
+        let first = msgs[0];
+        let att = msgs.iter().any(|&i| entries[i].has_attachments);
+        let subject = msgs
+            .iter()
+            .map(|&i| entries[i].subject.clone())
+            .find(|s| !s.trim().is_empty())
+            .map(|s| clean_subject(&s))
+            .unwrap_or_default();
+        let e0 = &entries[first];
+        threads.push(Thread {
+            tid,
+            msgs,
+            subject,
+            from: format!("{} <{}>", e0.from.display_name, e0.from.address),
+            date: entries[latest].date,
+            attachments: att,
+        });
+    }
+    let mut order: Vec<usize> = (0..threads.len()).collect();
+    order.sort_by(|&a, &b| threads[b].date.cmp(&threads[a].date));
+    let tmap = threads.iter().enumerate().map(|(i, t)| (t.tid.clone(), i)).collect();
+    (threads, order, tmap)
+}
+
 
 fn parse_bound(s: &Option<String>) -> Option<DateTime<Utc>> {
     let trimmed = s.as_deref().unwrap_or("").trim();
@@ -400,6 +549,9 @@ async fn main() {
             entries: Vec::new(),
             order: Vec::new(),
             facets: Facets::default(),
+            threads: Vec::new(),
+            thread_order: Vec::new(),
+            tmap: HashMap::new(),
         })),
         data_dir,
         archive_dir,
@@ -422,6 +574,7 @@ async fn main() {
         .route("/api/search", get(search_handler))
         .route("/api/email/:id", get(get_email_content))
         .route("/api/email/:id/meta", get(email_meta))
+        .route("/api/thread", get(thread_detail))
         .route("/api/attachment/:id/:part", get(get_attachment_data))
         .route("/api/status", get(status_handler))
         .route("/api/backup", post(backup_handler))
@@ -618,12 +771,17 @@ async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
         match builder::build_index(&target_path, false, None) {
             Ok(entries) => {
                 let facets = compute_facets(&entries);
+                let (threads, thread_order, tmap) = build_threads(&entries);
                 let mut order: Vec<usize> = (0..entries.len()).collect();
                 order.sort_by(|&a, &b| entries[b].date.cmp(&entries[a].date));
+                info!("Threading: {} conversations", threads.len());
                 let mut lock = inner.write().unwrap();
                 lock.mbox_path = Some(target_path);
                 lock.facets = facets;
                 lock.order = order;
+                lock.threads = threads;
+                lock.thread_order = thread_order;
+                lock.tmap = tmap;
                 lock.entries = entries;
                 info!("Indexing complete. Total messages: {}", lock.entries.len());
             }
@@ -700,7 +858,7 @@ async fn filters_handler(
 async fn list_messages(
     State(state): State<AppState>,
     Query(params): Query<FilterParams>,
-) -> Json<Vec<EmailMetadata>> {
+) -> Json<Vec<ThreadOut>> {
     let inner = state.inner.clone();
     let items = tokio::task::spawn_blocking(move || {
         let lock = inner.read().unwrap();
@@ -718,11 +876,11 @@ async fn list_messages(
             || want_att;
 
         if !filtered {
-            return match lock.order.get(offset..) {
+            return match lock.thread_order.get(offset..) {
                 Some(slice) => slice
                     .iter()
                     .take(limit)
-                    .map(|&idx| metadata_for(&lock, idx))
+                    .map(|&ti| thread_out(&lock.threads[ti], 0))
                     .collect(),
                 None => Vec::new(),
             };
@@ -730,9 +888,13 @@ async fn list_messages(
 
         let mut out = Vec::new();
         let mut skipped = 0usize;
-        for &idx in &lock.order {
-            let entry = &lock.entries[idx];
-            if !sel_ok(entry, &s, 3) || !date_att_ok(entry, &after, &before, want_att) {
+        for &ti in &lock.thread_order {
+            let t = &lock.threads[ti];
+            let pass = (!want_att || t.attachments)
+                && t.msgs
+                    .iter()
+                    .any(|&i| sel_ok(&lock.entries[i], &s, 3) && date_att_ok(&lock.entries[i], &after, &before, false));
+            if !pass {
                 continue;
             }
             if skipped < offset {
@@ -742,7 +904,7 @@ async fn list_messages(
             if out.len() >= limit {
                 break;
             }
-            out.push(metadata_for(&lock, idx));
+            out.push(thread_out(t, 0));
         }
         out
     })
@@ -752,10 +914,38 @@ async fn list_messages(
     Json(items)
 }
 
+#[derive(Serialize)]
+struct ThreadDetail {
+    tid: String,
+    subject: String,
+    messages: Vec<EmailMetadata>,
+}
+
+#[derive(Deserialize)]
+struct TidParam {
+    tid: String,
+}
+
+async fn thread_detail(State(state): State<AppState>, Query(q): Query<TidParam>) -> impl IntoResponse {
+    let lock = state.inner.read().unwrap();
+    match lock.tmap.get(&q.tid) {
+        Some(&ti) => {
+            let t = &lock.threads[ti];
+            Json(ThreadDetail {
+                tid: q.tid.clone(),
+                subject: t.subject.clone(),
+                messages: t.msgs.iter().map(|&i| metadata_for(&lock, i)).collect(),
+            })
+            .into_response()
+        }
+        None => (StatusCode::NOT_FOUND, "Thread not found").into_response(),
+    }
+}
+
 async fn search_handler(
     State(state): State<AppState>,
     Query(params): Query<FilterParams>,
-) -> Json<Vec<EmailMetadata>> {
+) -> Json<Vec<ThreadOut>> {
     let inner = state.inner.clone();
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
@@ -779,13 +969,29 @@ async fn search_handler(
             true
         };
         match search::execute(&mbox_path, &lock.entries, &q, Some(&progress)) {
-            Ok((_, mut results)) => {
-                results.sort_unstable_by(|&a, &b| lock.entries[b].date.cmp(&lock.entries[a].date));
-                results
-                    .iter()
+            Ok((_, results)) => {
+                // Fold matching messages into their threads; a thread shows if
+                // any message matches, with `matched` counting the hits.
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                let mut tids: Vec<usize> = Vec::new();
+                for &idx in &results {
+                    let tid = tid_of(&lock.entries, idx);
+                    let c = counts.entry(tid.clone()).or_insert(0);
+                    *c += 1;
+                    if *c == 1 {
+                        if let Some(&ti) = lock.tmap.get(&tid) {
+                            tids.push(ti);
+                        }
+                    }
+                }
+                tids.sort_by(|&a, &b| lock.threads[b].date.cmp(&lock.threads[a].date));
+                tids.iter()
                     .skip(offset)
                     .take(limit)
-                    .map(|&idx| metadata_for(&lock, idx))
+                    .map(|&ti| {
+                        let t = &lock.threads[ti];
+                        thread_out(t, counts.get(&t.tid).copied().unwrap_or(0))
+                    })
                     .collect()
             }
             Err(e) => {
@@ -803,6 +1009,7 @@ async fn search_handler(
 async fn get_email_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let idx: usize = match id.parse() {
         Ok(i) => i,
@@ -834,7 +1041,9 @@ async fn get_email_content(
                 let mut headers = HeaderMap::new();
                 headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
                 headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-                (headers, axum::response::Html(html)).into_response()
+                let want_clean = q.get("clean").map(|v| v == "1").unwrap_or(false);
+                let out = if want_clean { render_clean(&html) } else { html };
+                (headers, axum::response::Html(out)).into_response()
             } else if let Some(text) = &body.text {
                 text.clone().into_response()
             } else {

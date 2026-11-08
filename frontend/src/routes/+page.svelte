@@ -1,5 +1,5 @@
 <script>
-    import { onMount } from 'svelte';
+    import { onMount, tick } from 'svelte';
 
     let query = "";
     let emails = [];
@@ -22,6 +22,25 @@
     let offset = 0;
     let selectedEmail = null;
     let selectedEmailContent = "";
+    let selectedThread = null;
+    let threadMsgs = [];
+    let msgData = {};
+    let openMsgs = {};
+    let openQuotes = {};
+    let mailPane;
+
+    // Renders sanitized email HTML in a shadow root: email <style> stays scoped,
+    // content flows at natural height, one scrollbar for the whole conversation.
+    function shadowHtml(node, html) {
+        let root = node.attachShadow({ mode: 'open' });
+        const style = document.createElement('style');
+        style.textContent = 'img,table{max-width:100%} img{height:auto} details{margin-top:.6rem} summary{cursor:pointer;color:#06c;font-size:.8rem} pre{white-space:pre-wrap;font-family:inherit}';
+        root.appendChild(style);
+        const wrap = document.createElement('div');
+        root.appendChild(wrap);
+        wrap.innerHTML = html || '';
+        return { update(h) { wrap.innerHTML = h || ''; } };
+    }
     let meta = null;
     let loading = false;
     let expanded = false;
@@ -44,6 +63,12 @@
         if (isNaN(d.getTime())) return iso;
         return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
             + " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    }
+
+    function fmtDateOnly(ts) {
+        const d = new Date(ts);
+        if (isNaN(d.getTime())) return String(ts);
+        return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
     }
 
     function fmtMonth(ts) {
@@ -349,7 +374,10 @@
         }
         loading = true;
         mode = "search";
+        emails = [];
         selectedEmail = null;
+        selectedThread = null;
+        threadMsgs = [];
         try {
             const p = facetParams();
             p.set("q", trimmed);
@@ -368,19 +396,100 @@
         }
     }
 
-    async function selectEmail(email) {
-        selectedEmail = email;
-        selectedEmailContent = "Loading...";
-        meta = null;
+    async function toggleMsg(m) {
+        const id = m.id;
+        if (openMsgs[id]) {
+            openMsgs = { ...openMsgs, [id]: false };
+            return;
+        }
+        openMsgs = { ...openMsgs, [id]: true };
+        await ensureContent(m);
+        const d = msgData[id];
+        if (d && !d.meta) {
+            try {
+                const metaRes = await fetch(`${API_URL}/email/${id}/meta`);
+                msgData = { ...msgData, [id]: { ...d, meta: metaRes.ok ? await metaRes.json() : null } };
+            } catch (e) {
+                msgData = { ...msgData, [id]: { ...d, meta: null } };
+            }
+        }
+    }
+
+    async function ensureContent(m) {
+        const id = m.id;
+        if (msgData[id] && msgData[id].content !== "") return;
+        if (!msgData[id]) {
+            msgData = { ...msgData, [id]: { loading: true, meta: null, content: "" } };
+        }
         try {
-            const [m, c] = await Promise.all([
-                fetch(`${API_URL}/email/${email.id}/meta`).then(r => r.ok ? r.json() : null),
-                fetch(`${API_URL}/email/${email.id}`).then(r => r.text())
-            ]);
-            meta = m;
-            selectedEmailContent = c;
+            const content = await fetch(`${API_URL}/email/${id}?clean=1`).then(r => r.text());
+            msgData = { ...msgData, [id]: { ...msgData[id], loading: false, content } };
         } catch (e) {
-            selectedEmailContent = "Error loading content";
+            msgData = { ...msgData, [id]: { loading: false, meta: msgData[id].meta, content: "Error loading content" } };
+        }
+    }
+
+    function splitQuoted(text) {
+        const lines = text.split("\n");
+        let first = -1;
+        for (let i = 0; i < lines.length; i++) {
+            const l = lines[i];
+            if (/^>/.test(l)) {
+                if (first === -1) first = i;
+            } else if (l.trim() !== "") {
+                first = -1;
+            }
+        }
+        if (first < 0) return null;
+        while (first > 0 && /^(on .+ wrote:|-+ ?original message ?-+|begin forwarded message|forwarded message|__.*__)$/i.test(lines[first - 1].trim())) {
+            first--;
+        }
+        const head = lines.slice(0, first).join("\n");
+        if (!head.trim()) return null;
+        return { head, quote: lines.slice(first).join("\n") };
+    }
+
+    function previewOf(c) {
+        if (!c) return "";
+        const text = c.trim().startsWith('<')
+            ? c.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+                 .replace(/<[^>]+>/g, ' ')
+                 .replace(/&nbsp;/g, ' ')
+                 .replace(/\s+/g, ' ')
+                 .trim()
+            : c.trim();
+        return text.slice(0, 300);
+    }
+
+    async function selectThread(t) {
+        selectedThread = t;
+        threadMsgs = [];
+        msgData = {};
+        openMsgs = {};
+        meta = null;
+        selectedEmail = null;
+        selectedEmailContent = "";
+        try {
+            const res = await fetch(`${API_URL}/thread?tid=${encodeURIComponent(t.tid)}`);
+            const d = await res.json();
+            threadMsgs = d.messages;
+            // Load everything in parallel, then show the complete conversation
+            // in one paint — no staged pop-in, no late scroll.
+            const pairs = await Promise.all(d.messages.map(async m => {
+                const [content, metaRes] = await Promise.all([
+                    fetch(`${API_URL}/email/${m.id}?clean=1`).then(r => r.text()),
+                    fetch(`${API_URL}/email/${m.id}/meta`).then(r => r.ok ? r.json() : null).catch(() => null)
+                ]);
+                return [m.id, { loading: false, meta: metaRes, content }];
+            }));
+            msgData = Object.fromEntries(pairs);
+            openMsgs = Object.fromEntries(d.messages.map(m => [m.id, true]));
+            await tick();
+            if (mailPane) {
+                mailPane.scrollTop = mailPane.scrollHeight;
+            }
+        } catch (e) {
+            console.error(e);
         }
     }
 </script>
@@ -542,16 +651,16 @@
                     <div class="empty">No emails match. Adjust filters, or drop .mbox files in data/ and re-scan.</div>
                 {/if}
             {:else}
-                {#each emails as email (email.id)}
+                {#each emails as t (t.tid)}
                     <div
                         class="email-item"
-                        class:selected={selectedEmail && selectedEmail.id === email.id}
-                        on:click={() => selectEmail(email)}
+                        class:selected={selectedThread && selectedThread.tid === t.tid}
+                        on:click={() => selectThread(t)}
                     >
-                        <div class="subject" title={email.subject}>{#if email.attachments}<span class="clip" title="Has attachments">📎</span>{/if}{email.subject || '(No Subject)'}</div>
+                        <div class="subject" title={t.subject}>{#if t.attachments}<span class="clip" title="Has attachments">📎</span>{/if}{t.subject || '(No Subject)'}{#if t.count > 1}<span class="badge">{mode === 'search' && t.matched ? `${t.matched}/${t.count}` : t.count}</span>{/if}</div>
                         <div class="meta">
-                            <span class="from" title={email.from}>{email.from}</span>
-                            <span class="date">{fmtDate(email.date)}</span>
+                            <span class="from" title={t.from}>{t.from}</span>
+                            <span class="date">{fmtDate(t.date)}</span>
                         </div>
                     </div>
                 {/each}
@@ -571,63 +680,96 @@
         </div>
     </section>
 
-    <section class="pane pane-email" class:has-email={selectedEmail !== null}>
-        {#if selectedEmail}
+    <section class="pane pane-email" bind:this={mailPane} class:has-email={selectedThread !== null}>
+        {#if selectedThread}
             <div class="email-tools">
-                <button class="back-btn" on:click={() => { selectedEmail = null; expanded = false; }}>Back</button>
+                <button class="back-btn" on:click={() => { selectedThread = null; threadMsgs = []; openMsgs = {}; msgData = {}; expanded = false; }}>Back</button>
                 <button class="fs-toggle" on:click={() => expanded = !expanded}>
                     {expanded ? 'Restore' : 'Full screen'}
                 </button>
             </div>
             <div class="email-view">
                 <div class="header">
-                    <h2>{selectedEmail.subject}</h2>
-                    <p><strong>From:</strong> {selectedEmail.from}</p>
-                    {#if meta && meta.to.length}
-                        <p><strong>To:</strong> {meta.to.join(', ')}</p>
-                    {/if}
-                    <p><strong>Date:</strong> {fmtDate(selectedEmail.date)}</p>
-                    {#if meta && meta.labels.length}
-                        <div class="label-row header-labels">
-                            {#each meta.labels as l (l)}
-                                <span class="chip sm">{dispFor(l)}</span>
-                            {/each}
-                        </div>
+                    <h2>{selectedThread.subject || '(No Subject)'}</h2>
+                    {#if threadMsgs.length > 1}
+                        <p class="thread-count">{threadMsgs.length} messages · {fmtDateOnly(threadMsgs[0].date)} – {fmtDateOnly(threadMsgs[threadMsgs.length - 1].date)}</p>
                     {/if}
                 </div>
 
-                {#if meta && meta.attachments.some(a => !a.is_inline)}
-                    <div class="attachments">
-                        <h3>
-                            Attachments
-                            {#if meta.inline_images}
-                                <span class="note">({meta.inline_images} image{meta.inline_images === 1 ? '' : 's'} also shown inline)</span>
+                {#each threadMsgs as m (m.id)}
+                    <div class="tmsg" class:open={openMsgs[m.id]}>
+                        <button class="tmsg-head" on:click={() => toggleMsg(m)}>
+                            <div class="tmsg-row">
+                                <span class="chev">{openMsgs[m.id] ? '▾' : '▸'}</span>
+                                <span class="who">{m.from.split(' <')[0]}</span>
+                                <span class="when">{fmtDateOnly(m.date)}</span>
+                                {#if m.attachments}<span class="clip">📎</span>{/if}
+                            </div>
+                            {#if !openMsgs[m.id]}
+                                {#if msgData[m.id] && !msgData[m.id].loading}
+                                    <div class="excerpt">{previewOf(msgData[m.id].content)}</div>
+                                {:else}
+                                    <div class="excerpt dim">…</div>
+                                {/if}
                             {/if}
-                        </h3>
-                        {#each meta.attachments.filter(a => !a.is_inline) as a (a.part_index)}
-                            <a
-                                class="download"
-                                href="{API_URL}/attachment/{selectedEmail.id}/{a.part_index}"
-                            >Download: {a.filename} ({fmtBytes(a.size)}, {a.content_type})</a>
-                        {/each}
+                        </button>
+                        {#if openMsgs[m.id]}
+                            <div class="tmsg-body">
+                                {#if !msgData[m.id] || msgData[m.id].loading}
+                                    <div class="loading">Loading message…</div>
+                                {:else}
+                                    {@const md = msgData[m.id]}
+                                    <p class="from-line"><strong>From:</strong> {m.from}</p>
+                                    {#if md.meta && md.meta.to.length}
+                                        <p class="from-line"><strong>To:</strong> {md.meta.to.join(', ')}</p>
+                                    {/if}
+                                    {#if md.meta && md.meta.labels.length}
+                                        <div class="label-row header-labels">
+                                            {#each md.meta.labels as l (l)}
+                                                <span class="chip sm">{dispFor(l)}</span>
+                                            {/each}
+                                        </div>
+                                    {/if}
+                                    {#if md.meta && md.meta.attachments.some(a => !a.is_inline)}
+                                        <div class="attachments">
+                                            <h3>
+                                                Attachments
+                                                {#if md.meta.inline_images}
+                                                    <span class="note">({md.meta.inline_images} image{md.meta.inline_images === 1 ? '' : 's'} also shown inline)</span>
+                                                {/if}
+                                            </h3>
+                                            {#each md.meta.attachments.filter(a => !a.is_inline) as a (a.part_index)}
+                                                <a
+                                                    class="download"
+                                                    href="{API_URL}/attachment/{m.id}/{a.part_index}"
+                                                >Download: {a.filename} ({fmtBytes(a.size)}, {a.content_type})</a>
+                                            {/each}
+                                        </div>
+                                    {/if}
+                                    {#if md.content.trim().startsWith('<')}
+                                        <div class="email-html" use:shadowHtml={md.content}></div>
+                                    {:else if splitQuoted(md.content)}
+                                        {@const q = splitQuoted(md.content)}
+                                        <pre>{q.head}</pre>
+                                        <button
+                                            class="q-toggle"
+                                            on:click={() => openQuotes = { ...openQuotes, [m.id]: !openQuotes[m.id] }}
+                                        >{openQuotes[m.id] ? 'Hide quoted text' : `Show quoted text (${q.quote.split('\n').length} lines)`}</button>
+                                        {#if openQuotes[m.id]}
+                                            <pre class="quote">{q.quote}</pre>
+                                        {/if}
+                                    {:else}
+                                        <pre>{md.content}</pre>
+                                    {/if}
+                                {/if}
+                            </div>
+                        {/if}
                     </div>
-                {/if}
-
-                <div class="body">
-                    {#if selectedEmailContent.trim().startsWith('<')}
-                        <iframe
-                            srcdoc={selectedEmailContent}
-                            title="Email content"
-                            sandbox="allow-popups"
-                        ></iframe>
-                    {:else}
-                        <pre>{selectedEmailContent}</pre>
-                    {/if}
-                </div>
+                {/each}
             </div>
         {:else}
             <div class="placeholder">
-                Select an email to view
+                Select a conversation to view
             </div>
         {/if}
     </section>
@@ -1018,6 +1160,72 @@
         margin-right: 0.35rem;
         opacity: 0.75;
     }
+    .badge {
+        display: inline-block;
+        margin-left: 0.45rem;
+        padding: 0 0.4rem;
+        border-radius: 8px;
+        background: #d3e3fd;
+        color: #1c3aa9;
+        font-size: 0.7rem;
+        font-weight: 600;
+        vertical-align: middle;
+    }
+    .thread-count {
+        color: #777;
+        font-size: 0.8rem;
+        margin: 0.2rem 0 0;
+    }
+    .tmsg {
+        border: 1px solid #e3e3e3;
+        border-radius: 6px;
+        margin-bottom: 0.5rem;
+    }
+    .tmsg.open {
+        border-color: #c8d8f0;
+    }
+    .tmsg-head {
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        width: 100%;
+        padding: 0.45rem 0.7rem;
+        background: #fafafa;
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-size: 0.85rem;
+        text-align: left;
+    }
+    .tmsg.open .tmsg-head {
+        background: #eef4fd;
+        border-bottom: 1px solid #e3ecf8;
+        border-radius: 6px 6px 0 0;
+    }
+    .chev {
+        color: #888;
+        width: 0.7rem;
+    }
+    .who {
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .when {
+        margin-left: auto;
+        color: #777;
+        font-size: 0.75rem;
+        white-space: nowrap;
+    }
+    .tmsg-body {
+        padding: 0.7rem 1rem;
+    }
+    .from-line {
+        margin: 0.2rem 0;
+        font-size: 0.85rem;
+        color: #333;
+    }
     .meta {
         font-size: 0.8rem;
         color: #666;
@@ -1063,15 +1271,43 @@
         border-radius: 4px;
         font-size: 0.9rem;
     }
-    .body iframe {
-        width: 100%;
-        height: calc(100vh - 340px);
-        min-height: 420px;
-        border: 1px solid #ddd;
-        background: white;
+    .email-html {
+        background: #fff;
+        border: 1px solid #eee;
+        border-radius: 4px;
+        padding: 0.9rem 1.1rem;
+        font-size: 0.92rem;
+        color: #222;
+        overflow-wrap: break-word;
     }
-    .email-expanded .body iframe {
-        height: calc(100vh - 220px);
+    .email-html :global(img) {
+        max-width: 100%;
+        height: auto;
+    }
+    .email-html :global(table) {
+        max-width: 100%;
+    }
+    .email-html :global(details.quotes) {
+        margin-top: 0.6rem;
+    }
+    .email-html :global(details.quotes > summary) {
+        cursor: pointer;
+        color: #06c;
+        font-size: 0.8rem;
+        margin-bottom: 0.4rem;
+    }
+    .q-toggle {
+        border: none;
+        background: transparent;
+        color: #06c;
+        font-size: 0.8rem;
+        cursor: pointer;
+        padding: 0.2rem 0;
+        text-align: left;
+    }
+    pre.quote {
+        opacity: 0.8;
+        border-left: 3px solid #ddd;
     }
     .attachments {
         border: 1px solid #ddd;
@@ -1157,10 +1393,6 @@
         .fs-toggle {
             display: none;
         }
-        .body iframe {
-            height: calc(100vh - 230px);
-            min-height: 300px;
-        }
     }
     @media (max-width: 640px) {
         .container {
@@ -1217,10 +1449,6 @@
         }
         .fs-toggle {
             display: none;
-        }
-        .body iframe {
-            height: calc(100vh - 230px);
-            min-height: 300px;
         }
     }
 </style>
