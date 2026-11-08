@@ -101,35 +101,26 @@
     <section class="intro">
         <h2>How this backup works</h2>
         <p>
-            This drive holds your <em>complete</em> email archive. Gmail is the source of truth only until you
-            clean up there — afterwards, <strong>this copy is what preserves history</strong>. Merging never
-            removes anything: it reads every <code>.mbox</code> in <code>data/</code> — including
-            <code>merged.mbox</code> itself, which makes the archive cumulative — and for emails present in
-            more than one file it keeps the copy from the newest one (so labels and read-status stay current).
-            Emails you <em>deleted</em> in Gmail keep living on in the archive untouched. The result is written
-            to a temp file and renamed only when the full copy succeeds — a failed merge can never damage your
-            existing archive.
+            This drive holds your <em>complete</em> email archive; Gmail only decides what's <em>new</em>.
+            A merge never removes anything: it takes the union of every dropped file plus the existing
+            archive (kept apart in <code>archive/</code>, so the drop folder can never disturb it), newest
+            version wins for duplicates, and it lands atomically — a failed merge can't damage what you have.
         </p>
     </section>
 
     <section class="step">
         <h2><span class="num">1</span> Bring the new Takeout in</h2>
         <p>
-            Unzip the new Gmail Takeout and copy the <code>.mbox</code> file(s) into the <code>data/</code>
-            folder on this drive — anywhere under it works (a <code>data/incoming/</code> subfolder keeps
-            things tidy). The merged archive itself always lives at <code>data/merged.mbox</code>.
-            You do <em>not</em> need to keep old raw exports around once they've been merged —
-            <code>merged.mbox</code> already contains everything they ever contributed.
+            Unzip the new Gmail Takeout and copy its <code>.mbox</code> file(s) into <code>data/</code>
+            on this drive. That folder is a drop inbox — it's emptied in step 4 and safe to tidy anytime.
         </p>
     </section>
 
     <section class="step">
         <h2><span class="num">2</span> Merge</h2>
         <p>
-            Rebuilds <code>merged.mbox</code> from every <code>.mbox</code> present, the existing archive
-            included: union of all messages, newest file wins for duplicates. Needs roughly one
-            archive-size of free space while running. Re-running it with nothing new is harmless — the
-            merge is idempotent.
+            Folds the new files into the archive. Needs about one archive-size of free space while
+            running; harmless to repeat.
         </p>
         <button on:click={runMerge} disabled={status?.busy}>
             {status?.busy ? "Working…" : "Merge all mbox files"}
@@ -139,10 +130,8 @@
     <section class="step">
         <h2><span class="num">3</span> Re-scan</h2>
         <p>
-            Rebuilds the search index over a <em>single</em> archive file: <code>merged.mbox</code> if it
-            exists, otherwise the newest <code>.mbox</code> found (the server logs a warning when other
-            files would be ignored — that means you wanted Merge first). Fast if the index already exists;
-            a first pass on a multi-gigabyte archive takes a few minutes.
+            Rebuilds the search index — a second if it already exists, a few minutes on a first pass
+            over a giant archive. (Before your first merge it only sees the newest single file.)
         </p>
         <button on:click={runScan} disabled={status?.busy}>
             {status?.busy ? "Working…" : "Re-scan the archive"}
@@ -152,23 +141,18 @@
     <section class="step">
         <h2><span class="num">4</span> Verify, then tidy</h2>
         <p>
-            Check the stats at the top before trusting anything: <strong>emails indexed</strong> should be ≥
-            last time, and <strong>latest</strong> should show the new export's date. Once the numbers look
-            right, you can delete the raw takeout files from <code>data/</code> — their content now lives in
-            <code>merged.mbox</code>, and the next merge will grow the archive from that.
+            Check the stats above before trusting anything: count should be ≥ last time, latest should
+            be the new export's date. Then empty <code>data/</code> freely — everything is in the archive now.
         </p>
     </section>
 
     <section class="step">
         <h2><span class="num">5</span> Safe copy (redundancy)</h2>
         <p>
-            Copies the current archive to the backup location as a timestamped, gzip-compressed file
-            (<code>mbox-archive-&lt;date&gt;.mbox.gz</code> — takeout mboxes typically shrink to a third of
-            their size). It is written to a temp file, then <em>verified by decompressing the whole backup
-            and comparing byte counts</em> before being renamed into place — a partial or corrupt backup
-            never shows up as a completed one. The progress bar below updates live.
-            Point <code>BACKUP_DIR</code> in the compose file at a <em>different</em> physical disk than
-            <code>DATA_DIR</code> for it to mean anything.
+            Writes a timestamped, gzip-compressed copy of the archive — verified end-to-end by
+            decompressing it before it counts as done (takeout mboxes shrink to roughly a third).
+            The bar below updates live. Put <code>BACKUP_DIR</code> on a <em>different</em> physical
+            disk than <code>DATA_DIR</code> for it to mean anything.
         </p>
         <button class="backup" on:click={runBackup} disabled={status?.busy || status?.backup?.running}>
             {status?.backup?.running ? "Backup running…" : "Safe-copy the archive now"}
@@ -198,11 +182,9 @@
     <section class="step housekeeping">
         <h2>Golden rule</h2>
         <p>
-            Never let a period of your history exist in only one place. After a Safe copy, the archive exists
-            twice (drive + backup location). If the backup location is on the same physical drive, treat it as
-            convenience, not redundancy. Old <code>mbox-archive-*</code> snapshots are just points in time —
-            once a newer verified backup exists, you can delete the older ones (many people keep the newest
-            plus one).
+            Never let a period of your history exist in only one place. If the backup folder lives on
+            the same drive as the archive, it's convenience, not redundancy. Old
+            <code>mbox-archive-*</code> snapshots can be pruned freely — keep the newest, plus one.
         </p>
     </section>
 </div>

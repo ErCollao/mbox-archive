@@ -34,6 +34,7 @@ use tracing::{info, error, warn};
 struct AppState {
     inner: Arc<RwLock<AppStateInner>>,
     data_dir: PathBuf,
+    archive_dir: PathBuf,
     backup_dir: PathBuf,
     busy: Arc<AtomicBool>,
     backup: Arc<Mutex<BackupProgress>>,
@@ -401,6 +402,9 @@ async fn main() {
     let backup_dir = PathBuf::from(
         std::env::var("BACKUP_DIR").unwrap_or_else(|_| "/backup".to_string()),
     );
+    let archive_dir = PathBuf::from(
+        std::env::var("ARCHIVE_DIR").unwrap_or_else(|_| "/archive".to_string()),
+    );
 
     let state = AppState {
         inner: Arc::new(RwLock::new(AppStateInner {
@@ -410,6 +414,7 @@ async fn main() {
             facets: Facets::default(),
         })),
         data_dir,
+        archive_dir,
         backup_dir,
         busy: Arc::new(AtomicBool::new(false)),
         backup: Arc::new(Mutex::new(BackupProgress::default())),
@@ -442,6 +447,7 @@ async fn main() {
 
 async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     let data_dir = state.data_dir.clone();
+    let archive_dir = state.archive_dir.clone();
     state.busy.store(true, Ordering::SeqCst);
 
     tokio::task::spawn_blocking(move || {
@@ -455,6 +461,15 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 mbox_files.push((entry.path().to_path_buf(), mt));
             }
+        }
+        // The existing archive (kept in its own folder) is always a source.
+        let archived = archive_dir.join("merged.mbox");
+        if archived.exists() {
+            let mt = archived
+                .metadata()
+                .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            mbox_files.push((archived, mt));
         }
         // merged.mbox itself is a valid source: the archive accumulates
         // in place, so raw exports can be deleted once merged. The output
@@ -486,8 +501,12 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
             }
         }
 
-        let output = data_dir.join("merged.mbox");
-        let tmp = data_dir.join("merged.mbox.tmp");
+        let output = archive_dir.join("merged.mbox");
+        if fs::create_dir_all(&archive_dir).is_err() {
+            error!("Merge aborted: cannot create archive dir {:?}", archive_dir);
+            return;
+        }
+        let tmp = archive_dir.join("merged.mbox.tmp");
         info!("Merging {} files into {:?}", mbox_files.len(), output);
         let mut out = match fs::File::create(&tmp) {
             Ok(f) => BufWriter::with_capacity(1 << 20, f),
@@ -564,11 +583,20 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
 async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     let inner = state.inner.clone();
     let data_dir = state.data_dir.clone();
+    let archive_dir = state.archive_dir.clone();
     state.busy.store(true, Ordering::SeqCst);
 
     tokio::task::spawn_blocking(move || {
         let _busy = BusyGuard(state.busy.clone());
-        let merged_path = data_dir.join("merged.mbox");
+        // The archive lives apart from the upload folder so it can't be
+        // cleaned up by accident: data/ is for drops, archive/ is the keeper.
+        let mut merged_path = archive_dir.join("merged.mbox");
+        if !merged_path.exists() {
+            let old_layout = data_dir.join("merged.mbox");
+            if old_layout.exists() {
+                merged_path = old_layout;
+            }
+        }
         let target_path = if merged_path.exists() {
             merged_path
         } else {

@@ -3,5 +3,6 @@ backend/target
 frontend/.svelte-kit
 frontend/build
 data/
+archive/
 backup/
 testdata/

@@ -4,6 +4,7 @@ services:
     # No ports exposed to host, only accessible within docker network
     volumes:
       - ${DATA_DIR:-./data}:/data
+      - ${ARCHIVE_DIR:-./archive}:/archive
       - ${BACKUP_DIR:-./backup}:/backup
       - index-data:/index
     restart: unless-stopped
