@@ -72,7 +72,6 @@ impl Default for Facets {
 #[derive(Deserialize)]
 struct FilterParams {
     q: Option<String>,
-    top: Option<String>,
     cat: Option<String>,
     status: Option<String>,
     other: Option<String>,
@@ -173,17 +172,15 @@ fn csv_labels(s: &Option<String>) -> Vec<String> {
 
 #[derive(Default)]
 struct Sel {
-    top: Option<String>,
     cat: Option<String>,
-    status: Vec<String>,
+    status: Option<String>,
     other: Vec<String>,
 }
 
 fn parse_sel(p: &FilterParams) -> Sel {
     Sel {
-        top: p.top.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
         cat: p.cat.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
-        status: csv_labels(&p.status),
+        status: p.status.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
         other: csv_labels(&p.other),
     }
 }
@@ -192,8 +189,7 @@ fn has_lbl(e: &MailEntry, l: &str) -> bool {
     e.labels.iter().any(|x| x.eq_ignore_ascii_case(l))
 }
 
-const TOP_LABELS: [&str; 2] = ["Inbox", "Important"];
-const STATUS_LABELS: [&str; 8] = ["Unread", "Opened", "Archived", "Starred", "Sent", "Drafts", "Spam", "Trash"];
+const STATUS_LABELS: [&str; 10] = ["Inbox", "Important", "Unread", "Opened", "Archived", "Starred", "Sent", "Drafts", "Spam", "Trash"];
 /// Real Gmail inbox tabs. "Category Bills/Purchases/Travel/…" are auto-detected
 /// labels, not tabs: they live in the `other` group.
 const CATEGORY_TABS: [&str; 6] = [
@@ -208,38 +204,33 @@ const CATEGORY_TABS: [&str; 6] = [
 /// 0=top, 1=category, 2=status, 3=other. Frontend mirrors these constants.
 fn group_of(l: &str) -> u8 {
     let l = l.to_lowercase();
-    if TOP_LABELS.iter().any(|t| t.to_lowercase() == l) {
+    if CATEGORY_TABS.iter().any(|c| c.to_lowercase() == l) {
         0
-    } else if CATEGORY_TABS.iter().any(|c| c.to_lowercase() == l) {
-        1
     } else if STATUS_LABELS.iter().any(|s| s.to_lowercase() == l) {
-        2
+        1
     } else {
-        3
+        2
     }
 }
 
 /// Whether the entry satisfies the selection, optionally skipping one group
-/// (for per-group facet counts). Multiple values inside a toggle group are OR.
+/// (for per-group facet counts). 0=category, 1=status, 2=other; `other` values OR.
 fn sel_ok(e: &MailEntry, s: &Sel, skip: u8) -> bool {
     if skip != 0 {
-        if let Some(l) = &s.top {
-            if !has_lbl(e, l) {
-                return false;
-            }
-        }
-    }
-    if skip != 1 {
         if let Some(l) = &s.cat {
             if !has_lbl(e, l) {
                 return false;
             }
         }
     }
-    if skip != 2 && !s.status.is_empty() && !s.status.iter().any(|l| has_lbl(e, l)) {
-        return false;
+    if skip != 1 {
+        if let Some(l) = &s.status {
+            if !has_lbl(e, l) {
+                return false;
+            }
+        }
     }
-    if skip != 3 && !s.other.is_empty() && !s.other.iter().any(|l| has_lbl(e, l)) {
+    if skip != 2 && !s.other.is_empty() && !s.other.iter().any(|l| has_lbl(e, l)) {
         return false;
     }
     true
@@ -293,16 +284,13 @@ fn compose_query(p: &FilterParams) -> String {
 
     let s = parse_sel(p);
     let qterm = |l: &String| format!("label:\"{}\"", l.replace('"', ""));
-    if let Some(l) = &s.top {
-        parts.push(qterm(l));
-    }
     if let Some(l) = &s.cat {
         parts.push(qterm(l));
     }
-    // Values inside a toggle group are OR; groups combine by AND (juxtaposition).
-    if !s.status.is_empty() {
-        parts.push(s.status.iter().map(qterm).collect::<Vec<_>>().join(" OR "));
+    if let Some(l) = &s.status {
+        parts.push(qterm(l));
     }
+    // Values in `other` are OR; groups combine by AND (juxtaposition).
     if !s.other.is_empty() {
         parts.push(s.other.iter().map(qterm).collect::<Vec<_>>().join(" OR "));
     }
@@ -662,9 +650,8 @@ async fn filters_handler(
         let after = parse_bound(&params.after);
         let before = parse_bound(&params.before);
         let att = params.attachment.as_deref() == Some("1");
-        let any = s.top.is_some()
-            || s.cat.is_some()
-            || !s.status.is_empty()
+        let any = s.cat.is_some()
+            || s.status.is_some()
             || !s.other.is_empty()
             || after.is_some()
             || before.is_some()
@@ -682,14 +669,12 @@ async fn filters_handler(
             let a = sel_ok(e, &s, 0);
             let b = sel_ok(e, &s, 1);
             let c = sel_ok(e, &s, 2);
-            let d = sel_ok(e, &s, 3);
             for l in &e.labels {
                 // A label is counted under every filter except its own group's.
                 let inc = match group_of(l) {
                     0 => a,
                     1 => b,
-                    2 => c,
-                    _ => d,
+                    _ => c,
                 };
                 if inc {
                     *counts.entry(l.clone()).or_insert(0) += 1;
@@ -725,9 +710,8 @@ async fn list_messages(
         let after = parse_bound(&params.after);
         let before = parse_bound(&params.before);
         let want_att = params.attachment.as_deref() == Some("1");
-        let filtered = s.top.is_some()
-            || s.cat.is_some()
-            || !s.status.is_empty()
+        let filtered = s.cat.is_some()
+            || s.status.is_some()
             || !s.other.is_empty()
             || after.is_some()
             || before.is_some()
@@ -748,7 +732,7 @@ async fn list_messages(
         let mut skipped = 0usize;
         for &idx in &lock.order {
             let entry = &lock.entries[idx];
-            if !sel_ok(entry, &s, 4) || !date_att_ok(entry, &after, &before, want_att) {
+            if !sel_ok(entry, &s, 3) || !date_att_ok(entry, &after, &before, want_att) {
                 continue;
             }
             if skipped < offset {

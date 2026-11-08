@@ -6,8 +6,7 @@
     let mode = "inbox"; // "inbox" | "search"
     let searchBodies = false;
     let hasAttachments = false;
-    let sel = { top: null, cat: null };
-    let selStatus = [];
+    let sel = { cat: null, status: null };
     let selOther = [];
     let showAllLabels = false;
     let labels = [];
@@ -67,9 +66,8 @@
 
     function facetParams() {
         const p = new URLSearchParams();
-        if (sel.top) p.set("top", sel.top);
+        if (sel.status) p.set("status", sel.status);
         if (sel.cat) p.set("cat", sel.cat);
-        if (selStatus.length) p.set("status", selStatus.join(","));
         if (selOther.length) p.set("other", selOther.join(","));
         if (afterTs !== null) p.set("after", isoDate(afterTs));
         if (beforeTs !== null) p.set("before", isoDate(beforeTs));
@@ -98,8 +96,7 @@
 
     // Every section is single-select (click the active entry to clear it).
     // Fixed canonical Gmail labels live in Status; customs stay in Labels.
-    const TOP = ["Inbox", "Important"];
-    const STATUS = ["Unread", "Opened", "Archived", "Starred", "Sent", "Drafts", "Spam", "Trash"];
+    const STATUS = ["Inbox", "Important", "Unread", "Opened", "Archived", "Starred", "Sent", "Drafts", "Spam", "Trash"];
     // Real Gmail tabs, fixed order (Promotions last) + official icon colors.
     const CAT_TABS = {
         "Category Personal": "#F9AB00",
@@ -127,16 +124,13 @@
             .toString(16).padStart(2, "0");
         return `#${c(1)}${c(3)}${c(5)}`;
     }
-    $: topItems = labels
-        .filter(([n]) => TOP.includes(n))
-        .sort((a, b) => TOP.indexOf(a[0]) - TOP.indexOf(b[0]));
     $: catItems = labels
         .filter(([n]) => isCatTab(n))
         .sort((a, b) => CAT_ORDER.indexOf(a[0]) - CAT_ORDER.indexOf(b[0]));
     $: statusItems = labels
         .filter(([n]) => STATUS.includes(n))
         .sort((a, b) => STATUS.indexOf(a[0]) - STATUS.indexOf(b[0]));
-    $: otherItems = labels.filter(([n]) => !TOP.includes(n) && !STATUS.includes(n) && !isCatTab(n));
+    $: otherItems = labels.filter(([n]) => !STATUS.includes(n) && !isCatTab(n));
 
     // Hierarchical custom labels ("Vault/Academia/…"): show top level only,
     // parents-with-children first then leaves, alphabetical within each.
@@ -211,14 +205,13 @@
         expandedTree = { ...expandedTree, [full]: !expandedTree[full] };
     }
     $: groups = [
-        { head: null, field: "top", items: topItems },
         { head: "Categories", field: "cat", items: catItems },
         { head: "Labels", field: "other", items: otherItems },
         { head: "Status", field: "status", items: statusItems }
     ].filter(g => g.items.length);
 
     function activeLabels() {
-        return [sel.top, sel.cat, ...selStatus, ...selOther].filter(v => v !== null);
+        return [sel.cat, sel.status, ...selOther].filter(v => v !== null);
     }
 
     // Labels/Status toggle; top/Categories are single-select.
@@ -227,10 +220,6 @@
             selOther = selOther.includes(name)
                 ? selOther.filter(n => n !== name)
                 : [...selOther, name];
-        } else if (field === "status") {
-            selStatus = selStatus.includes(name)
-                ? selStatus.filter(n => n !== name)
-                : [...selStatus, name];
         } else {
             sel = { ...sel, [field]: sel[field] === name ? null : name };
         }
@@ -259,8 +248,6 @@
         if (c.kind === "label") {
             if (selOther.includes(c.n)) {
                 selOther = selOther.filter(n => n !== c.n);
-            } else if (selStatus.includes(c.n)) {
-                selStatus = selStatus.filter(n => n !== c.n);
             } else {
                 const f = fieldFor(c.n);
                 if (f) sel = { ...sel, [f]: null };
@@ -293,8 +280,7 @@
     }
 
     function clearFilters() {
-        sel = { top: null, cat: null };
-        selStatus = [];
+        sel = { cat: null, status: null };
         selOther = [];
         showAllLabels = false;
         afterTs = null;
@@ -348,7 +334,6 @@
         await loadFacets();
         // Default view: the actual inbox = Inbox + Personal, when present.
         const names = labels.map(([n]) => n);
-        if (names.includes("Inbox")) sel = { ...sel, top: "Inbox" };
         if (names.includes("Category Personal")) sel = { ...sel, cat: "Category Personal" };
         loadInbox();
     });
@@ -485,7 +470,7 @@
                             {/if}
                         {:else}
                             {#each g.items as [name, count] (name)}
-                                {@const active = g.field === 'status' ? selStatus.includes(name) : sel[g.field] === name}
+                                {@const active = sel[g.field] === name}
                                 <button
                                     class="label-item"
                                     class:on={active}
