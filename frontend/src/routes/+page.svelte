@@ -18,6 +18,8 @@
     let afterTs = null;
     let beforeTs = null;
     let hasMore = false;
+    let searchOffset = 0;
+    let moreSearch = false;
     let offset = 0;
     let selectedEmail = null;
     let selectedEmailContent = "";
@@ -351,21 +353,29 @@
         loadInbox();
     });
 
-    async function search() {
+    async function search(reset = true) {
         const trimmed = query.trim();
         if (!trimmed) {
             return loadInbox();
         }
+        if (reset) {
+            searchOffset = 0;
+            emails = [];
+        }
         loading = true;
         mode = "search";
-        emails = [];
         selectedEmail = null;
         try {
             const p = facetParams();
             p.set("q", trimmed);
             if (searchBodies) p.set("body", "1");
+            p.set("offset", searchOffset);
+            p.set("limit", 50);
             const res = await fetch(`${API_URL}/search?${p}`);
-            emails = await res.json();
+            const data = await res.json();
+            emails = reset ? data : emails.concat(data);
+            searchOffset += data.length;
+            moreSearch = data.length === 50;
         } catch (e) {
             console.error(e);
         } finally {
@@ -516,7 +526,7 @@
                     {#if loading}
                         Searching...
                     {:else if mode === 'search'}
-                        {emails.length} match{emails.length === 1 ? '' : 'es'}{emails.length === 50 ? ' (most recent shown)' : ''}
+                        {emails.length} match{emails.length === 1 ? '' : 'es'}{moreSearch ? ' (newest first)' : ''}
                     {:else}
                         {activeLabels().map(dispFor).join(' › ') || 'Inbox'}
                     {/if}
@@ -531,7 +541,7 @@
         </div>
 
         <div class="email-list">
-            {#if loading}
+            {#if loading && emails.length === 0}
                 <div class="loading">
                     {mode === 'search' && searchBodies
                         ? 'Scanning every message body — minutes on a large archive...'
@@ -547,7 +557,7 @@
                     <div class="empty">No emails match. Adjust filters, or drop .mbox files in data/ and re-scan.</div>
                 {/if}
             {:else}
-                {#each emails as email}
+                {#each emails as email (email.id)}
                     <div
                         class="email-item"
                         class:selected={selectedEmail && selectedEmail.id === email.id}
@@ -562,7 +572,14 @@
                 {/each}
                 {#if mode === 'inbox' && hasMore}
                     <div class="load-more">
-                        <button on:click={() => loadInbox(false)}>Load 100 more</button>
+                        <button on:click={() => loadInbox(false)} disabled={loading}>{loading ? 'Loading…' : 'Load 100 more'}</button>
+                    </div>
+                {:else if mode === 'search' && moreSearch}
+                    <div class="load-more">
+                        <button on:click={() => search(false)} disabled={loading}>{loading ? 'Loading…' : 'Load 50 more matches'}</button>
+                        {#if searchBodies}
+                            <div class="recheck">(re-scans the archive for the next page — takes minutes)</div>
+                        {/if}
                     </div>
                 {/if}
             {/if}
@@ -1114,6 +1131,11 @@
     .load-more button {
         padding: 0.5rem 1rem;
         cursor: pointer;
+    }
+    .load-more .recheck {
+        font-size: 0.72rem;
+        color: #888;
+        margin-top: 0.3rem;
     }
     @media (min-width: 901px) {
         .back-btn {

@@ -745,6 +745,8 @@ async fn search_handler(
     Query(params): Query<FilterParams>,
 ) -> Json<Vec<EmailMetadata>> {
     let inner = state.inner.clone();
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let q = compose_query(&params);
     if q.trim().is_empty() {
         return Json(Vec::new());
@@ -769,7 +771,8 @@ async fn search_handler(
                 results.sort_unstable_by(|&a, &b| lock.entries[b].date.cmp(&lock.entries[a].date));
                 results
                     .iter()
-                    .take(50)
+                    .skip(offset)
+                    .take(limit)
                     .map(|&idx| metadata_for(&lock, idx))
                     .collect()
             }
