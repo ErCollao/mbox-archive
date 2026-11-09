@@ -68,3 +68,20 @@ export async function POST({ params, request }) {
     const data = await response.text();
     return new Response(data, { status: response.status, headers: forwarded(response) });
 }
+
+/** @type {import('./$types').RequestHandler} */
+export async function DELETE({ params, request }) {
+    const targetUrl = `${BACKEND_URL}/api/${params.path}${new URL(request.url).search}`;
+    let response;
+    try {
+        response = await fetch(targetUrl, {
+            method: 'DELETE',
+            headers: { cookie: request.headers.get('cookie') || '' }
+        });
+    } catch (e) {
+        console.error('Proxy DELETE error:', e);
+        throw error(502, 'Backend unavailable');
+    }
+    const data = await response.text();
+    return new Response(data, { status: response.status, headers: forwarded(response) });
+}

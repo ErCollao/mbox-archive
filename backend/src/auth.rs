@@ -12,17 +12,16 @@ pub const COOKIE_NAME: &str = "mbx_s";
 pub const SESSION_YEARS: i64 = 1;
 
 #[derive(Deserialize)]
-struct ProfileFile {
-    name: String,
-    /// lowercase hex sha256 of the password
-    secret: String,
+pub struct StoredProfile {
+    pub name: String,
+    /// bcrypt hash ("$2...") or legacy lowercase hex sha256
+    pub secret: String,
 }
 
 #[derive(Clone)]
 pub struct Profile {
     pub slug: String,
     pub name: String,
-    pub secret_hex: String,
 }
 
 /// One folder per person: profiles/<slug>/profile.json. A folder without a
@@ -48,12 +47,11 @@ pub fn load_profiles(dir: &std::path::Path) -> Vec<Profile> {
         let json_path = path.join("profile.json");
         match fs::read_to_string(&json_path)
             .map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<ProfileFile>(&s).map_err(|e| e.to_string()))
+            .and_then(|s| serde_json::from_str::<StoredProfile>(&s).map_err(|e| e.to_string()))
         {
             Ok(pf) => out.push(Profile {
                 slug,
                 name: pf.name,
-                secret_hex: pf.secret.to_lowercase(),
             }),
             Err(err) => warn!("skipping profile {:?}: {}", json_path, err),
         }
@@ -184,4 +182,61 @@ pub fn find_portrait(profiles_dir: &std::path::Path, slug: &str) -> Option<(Path
         }
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// Live profile access: read/rewrite profile.json, bcrypt secrets, portraits.
+// The password endpoints own these files; login re-reads disk so changes
+// apply immediately without a restart.
+// ---------------------------------------------------------------------------
+
+pub fn read_profile(dir: &std::path::Path, slug: &str) -> Option<StoredProfile> {
+    let raw = fs::read_to_string(dir.join(slug).join("profile.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Legacy = plain sha256 hex; anything starting with `$2` is bcrypt.
+pub fn is_legacy(secret: &str) -> bool {
+    !secret.starts_with("$2")
+}
+
+pub fn verify_secret(stored: &str, password: &str) -> bool {
+    if is_legacy(stored) {
+        secret_matches(stored, password)
+    } else {
+        bcrypt::verify(password, stored).unwrap_or(false)
+    }
+}
+
+pub fn hash_password(password: &str) -> String {
+    // cost 10 ≈ a few hundred ms — painful for GPU crackers, invisible to humans.
+    bcrypt::hash(password, 10).expect("bcrypt hashing failed")
+}
+
+pub fn write_profile(dir: &std::path::Path, slug: &str, name: &str, secret: &str) -> std::io::Result<()> {
+    let target = dir.join(slug).join("profile.json");
+    let tmp = dir.join(slug).join("profile.json.tmp");
+    let body = format!(
+        "{{\n  \"name\": {},\n  \"secret\": \"{}\"\n}}\n",
+        serde_json::to_string(name).unwrap(),
+        secret
+    );
+    fs::write(&tmp, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&tmp, &target)
+}
+
+pub fn save_portrait(dir: &std::path::Path, slug: &str, bytes: &[u8], ext: &str) -> std::io::Result<()> {
+    delete_portrait(dir, slug);
+    fs::write(dir.join(slug).join(format!("portrait.{}", ext)), bytes)
+}
+
+pub fn delete_portrait(dir: &std::path::Path, slug: &str) {
+    for file in ["portrait.jpg", "portrait.jpeg", "portrait.png", "portrait.webp"] {
+        let _ = fs::remove_file(dir.join(slug).join(file));
+    }
 }
