@@ -208,6 +208,13 @@ fn tid_of(entries: &[MailEntry], idx: usize) -> String {
     }
 }
 
+const FOLD_STYLE: &str = r#"<style>
+details.quotes{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;}
+details.quotes>summary{color:#8a8a8a;cursor:pointer;padding:0.75rem 0 0.35rem;outline:none;list-style:none;}
+details.quotes>summary::-webkit-details-marker{display:none;}
+details.quotes[open]>summary{padding-top:0.9rem;color:#666;}
+</style>"#;
+
 /// Fold the quoted history of a reply into a collapsed native <details>.
 /// Gmail nests blockquotes (each reply wraps the previous whole thread), so we
 /// cut at the OUTERMOST quote marker. Both `<blockquote` and `gmail_quote` are
@@ -264,7 +271,7 @@ fn fold_quotes(html: &str) -> String {
                 return html.to_string();
             }
             format!(
-                "{}\n<details><summary>Show quoted text</summary>\n{}\n</details>",
+                "{}\n<details class=\"quotes\"><summary>Show quoted text</summary>\n{}\n</details>",
                 &html[..i],
                 &html[i..]
             )
@@ -1055,6 +1062,13 @@ async fn get_email_content(
                 // Untrusted email HTML: strip scripts (the frame adds back
                 // only its own height-reporter), fold quoted history safely.
                 let html = strip_scripts(&fold_quotes(&html));
+                // Folded quotes live inside the email document; ship a style
+                // so the summary matches the app chrome instead of serif.
+                let html = if html.contains("<details class=\"quotes\"") {
+                    format!("{FOLD_STYLE}{html}")
+                } else {
+                    html
+                };
                 let mut headers = HeaderMap::new();
                 headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
                 headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));

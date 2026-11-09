@@ -1,5 +1,5 @@
 <script>
-    import { onMount, tick } from 'svelte';
+    import { onMount } from 'svelte';
 
     let query = "";
     let emails = [];
@@ -20,86 +20,12 @@
     let searchOffset = 0;
     let moreSearch = false;
     let offset = 0;
-    let selectedEmail = null;
-    let selectedEmailContent = "";
     let selectedThread = null;
     let threadMsgs = [];
-    let msgData = {};
-    let openMsgs = {};
     let openQuotes = {};
-    let frameH = {};
     let mailPane;
-
-    // Email frames arrive with their scripts stripped; the only JS running
-    // inside is this height reporter, posted from an opaque sandbox origin.
-    function onFrameMsg(e) {
-        const d = e.data;
-        if (d && d.t === 'mbox-h' && typeof d.h === 'number') {
-            frameH = { ...frameH, [String(d.id)]: Math.min(20000, Math.max(80, d.h + 12)) };
-            // Extend the settle pin only while one is already running, so a
-            // later click inside a frame (e.g. "Show quoted text") never yanks.
-            if (Date.now() < anchorUntil) {
-                anchorUntil = Date.now() + 800;
-            }
-        }
-    }
-
-    // Keep the newest message pinned to the bottom of the pane while iframe
-    // heights settle after opening a thread; release after a quiet period,
-    // and instantly if the user scrolls themselves.
-    let anchorTimer = null;
-    let anchorUntil = 0;
-    let programmatic = false;
-
-    function reanchor() {
-        anchorUntil = Date.now() + 800;
-        if (anchorTimer) return;
-        const step = () => {
-            if (mailPane) {
-                programmatic = true;
-                mailPane.scrollTop = mailPane.scrollHeight;
-                requestAnimationFrame(() => { programmatic = false; });
-            }
-            if (Date.now() < anchorUntil) {
-                anchorTimer = setTimeout(step, 90);
-            } else {
-                anchorTimer = null;
-            }
-        };
-        step();
-    }
-
-    function onPaneScroll() {
-        if (!programmatic) {
-            anchorUntil = 0;
-            if (anchorTimer) {
-                clearTimeout(anchorTimer);
-                anchorTimer = null;
-            }
-        }
-    }
-
-    function frameDoc(html, id) {
-        // Email CSS often pins html/body to height:100%, which makes
-        // scrollHeight useless; measure the body's layout box instead.
-        const reporter = '<scr' + 'ipt>(function(){' +
-            'function p(){try{var b=document.body,d=document.documentElement;' +
-            'var h=Math.max(b?b.getBoundingClientRect().height:0,b?b.offsetHeight:0,b?b.scrollHeight:0,d?d.scrollHeight:0);' +
-            'parent.postMessage({t:"mbox-h",id:' + JSON.stringify(String(id)) + ',h:Math.round(h)},"*")}catch(e){}}' +
-            'function hook(){for(var i=0;i<document.images.length;i++){var im=document.images[i];' +
-            'if(!im._hb){im._hb=1;im.addEventListener("load",p);im.addEventListener("error",p);}}}' +
-            'window.addEventListener("load",function(){hook();p();setTimeout(p,400);});' +
-            'hook();' +
-            'if(window.MutationObserver){new MutationObserver(hook).observe(document.documentElement,{childList:true,subtree:true});}' +
-            'if(window.ResizeObserver){new ResizeObserver(p).observe(document.body||document.documentElement)}' +
-            'document.addEventListener("click",function(){setTimeout(p,80);setTimeout(p,600)});' +
-            '})();</scr' + 'ipt>';
-        const base = '<base target="_blank">';
-        if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, base + reporter + '</body>');
-        return html + base + reporter;
-    }
-
-    let meta = null;
+    let activeMsgId = null;
+    let active = { loading: true, meta: null, content: "" };
     let loading = false;
     let expanded = false;
     let drawerOpen = false;
@@ -118,7 +44,7 @@
 
     function fmtDate(iso) {
         const d = new Date(iso);
-        if (isNaN(d.getTime())) return iso;
+        if (isNaN(d.getTime())) return String(iso);
         return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
             + " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
     }
@@ -134,6 +60,8 @@
     }
 
     function fmtBytes(b) {
+        if (b == null) return "";
+        if (b >= 1073741824) return (b / 1073741824).toFixed(1) + " GB";
         if (b >= 1048576) return (b / 1048576).toFixed(1) + " MB";
         if (b >= 1024) return Math.round(b / 1024) + " KB";
         return b + " B";
@@ -143,44 +71,9 @@
         return n >= 10000 ? (n / 1000).toFixed(0) + "k" : n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n);
     }
 
-    function anyFilter() {
-        return activeLabels().length > 0 || afterTs !== null || beforeTs !== null || hasAttachments;
-    }
+    // ---------- filter model ----------
 
-    function facetParams() {
-        const p = new URLSearchParams();
-        if (sel.status) p.set("status", sel.status);
-        if (sel.cat) p.set("cat", sel.cat);
-        if (selOther.length) p.set("other", selOther.join(","));
-        if (afterTs !== null) p.set("after", isoDate(afterTs));
-        if (beforeTs !== null) p.set("before", isoDate(beforeTs));
-        if (hasAttachments) p.set("attachment", "1");
-        return p;
-    }
-
-    function applyFilters() {
-        refreshCounts();
-        if (query.trim()) search();
-        else loadInbox();
-    }
-
-    // Live facet counts: relabel the chips in place (order stays stable).
-    async function refreshCounts() {
-        try {
-            const res = await fetch(`${API_URL}/filters?${facetParams()}`);
-            if (!res.ok) return;
-            const f = await res.json();
-            const m = new Map(f.labels);
-            labels = labels.map(([n]) => [n, m.has(n) ? m.get(n) : 0]);
-        } catch (e) {
-            console.error(e);
-        }
-    }
-
-    // Every section is single-select (click the active entry to clear it).
-    // Fixed canonical Gmail labels live in Status; customs stay in Labels.
     const STATUS = ["Inbox", "Important", "Unread", "Opened", "Archived", "Starred", "Sent", "Drafts", "Spam", "Trash"];
-    // Real Gmail tabs, fixed order (Promotions last) + official icon colors.
     const CAT_TABS = {
         "Category Personal": "#F9AB00",
         "Category Social": "#4285F4",
@@ -190,7 +83,6 @@
         "Category Promotions": "#0B8043"
     };
     const CAT_ORDER = Object.keys(CAT_TABS);
-    // Bills/Purchases/Travel etc. are "detected" categories: normal labels.
     const isCatTab = (n) => n in CAT_TABS;
     const dispFor = (n) => (isCatTab(n) ? n.slice("Category ".length) : n);
 
@@ -201,12 +93,12 @@
         return `rgba(${r}, ${g}, ${b}, ${a})`;
     }
 
-    // Darker variant for text/border contrast on light backgrounds.
     function darken(hex, f = 0.62) {
         const c = (i) => Math.round(parseInt(hex.slice(i, i + 2), 16) * f)
             .toString(16).padStart(2, "0");
         return `#${c(1)}${c(3)}${c(5)}`;
     }
+
     $: catItems = labels
         .filter(([n]) => isCatTab(n))
         .sort((a, b) => CAT_ORDER.indexOf(a[0]) - CAT_ORDER.indexOf(b[0]));
@@ -215,7 +107,7 @@
         .sort((a, b) => STATUS.indexOf(a[0]) - STATUS.indexOf(b[0]));
     $: otherItems = labels.filter(([n]) => !STATUS.includes(n) && !isCatTab(n));
 
-    // Hierarchical custom labels ("Vault/Academia/…"): show top level only,
+    // Hierarchical custom labels ("Vault/Academia/…"): top level first,
     // parents-with-children first then leaves, alphabetical within each.
     let expandedTree = {};
 
@@ -235,7 +127,6 @@
                 }
                 siblings = node.children;
             }
-            // The exact path exists as a label itself (e.g. "Admin" plus "Admin/…").
             index.get(full).self = true;
         }
         return roots;
@@ -287,6 +178,7 @@
     function toggleExpand(full) {
         expandedTree = { ...expandedTree, [full]: !expandedTree[full] };
     }
+
     $: groups = [
         { head: "Categories", field: "cat", items: catItems },
         { head: "Labels", field: "other", items: otherItems },
@@ -297,7 +189,6 @@
         return [sel.cat, sel.status, ...selOther].filter(v => v !== null);
     }
 
-    // Labels/Status toggle; top/Categories are single-select.
     function pick(field, name) {
         if (field === "other") {
             selOther = selOther.includes(name)
@@ -313,6 +204,21 @@
     function fieldFor(name) {
         for (const [k, v] of Object.entries(sel)) if (v === name) return k;
         return null;
+    }
+
+    function anyFilter() {
+        return activeLabels().length > 0 || afterTs !== null || beforeTs !== null || hasAttachments;
+    }
+
+    function facetParams() {
+        const p = new URLSearchParams();
+        if (sel.status) p.set("status", sel.status);
+        if (sel.cat) p.set("cat", sel.cat);
+        if (selOther.length) p.set("other", selOther.join(","));
+        if (afterTs !== null) p.set("after", isoDate(afterTs));
+        if (beforeTs !== null) p.set("before", isoDate(beforeTs));
+        if (hasAttachments) p.set("attachment", "1");
+        return p;
     }
 
     $: chipList = [
@@ -346,6 +252,25 @@
         applyFilters();
     }
 
+    function applyFilters() {
+        refreshCounts();
+        if (query.trim()) search();
+        else loadInbox();
+    }
+
+    // Live facet counts: relabel the chips in place (order stays stable).
+    async function refreshCounts() {
+        try {
+            const res = await fetch(`${API_URL}/filters?${facetParams()}`);
+            if (!res.ok) return;
+            const f = await res.json();
+            const m = new Map(f.labels);
+            labels = labels.map(([n]) => [n, m.has(n) ? m.get(n) : 0]);
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
     function onSliderLo(e) {
         sliderLo = Math.min(Number(e.target.value), sliderHi);
         applyDates();
@@ -375,6 +300,8 @@
         drawerOpen = false;
         loadInbox();
     }
+
+    // ---------- data ----------
 
     async function loadFacets() {
         try {
@@ -413,20 +340,6 @@
         }
     }
 
-    onMount(() => {
-        window.addEventListener('message', onFrameMsg);
-        // Cleanup only ever runs in the browser (onMount is a no-op on the server).
-        return () => window.removeEventListener('message', onFrameMsg);
-    });
-
-    onMount(async () => {
-        await loadFacets();
-        // Default view: the actual inbox = Inbox + Personal, when present.
-        const names = labels.map(([n]) => n);
-        if (names.includes("Category Personal")) sel = { ...sel, cat: "Category Personal" };
-        loadInbox();
-    });
-
     async function search(reset = true) {
         const trimmed = query.trim();
         if (!trimmed) {
@@ -439,9 +352,9 @@
         loading = true;
         mode = "search";
         emails = [];
-        selectedEmail = null;
         selectedThread = null;
         threadMsgs = [];
+        activeMsgId = null;
         try {
             const p = facetParams();
             p.set("q", trimmed);
@@ -460,39 +373,67 @@
         }
     }
 
-    async function toggleMsg(m) {
-        const id = m.id;
-        if (openMsgs[id]) {
-            openMsgs = { ...openMsgs, [id]: false };
-            return;
-        }
-        openMsgs = { ...openMsgs, [id]: true };
-        await ensureContent(m);
-        const d = msgData[id];
-        if (d && !d.meta) {
-            try {
-                const metaRes = await fetch(`${API_URL}/email/${id}/meta`);
-                msgData = { ...msgData, [id]: { ...d, meta: metaRes.ok ? await metaRes.json() : null } };
-            } catch (e) {
-                msgData = { ...msgData, [id]: { ...d, meta: null } };
-            }
-        }
-    }
+    onMount(async () => {
+        await loadFacets();
+        // Default view: the main category, when present.
+        const names = labels.map(([n]) => n);
+        if (names.includes("Category Personal")) sel = { ...sel, cat: "Category Personal" };
+        loadInbox();
+    });
 
-    async function ensureContent(m) {
-        const id = m.id;
-        if (msgData[id] && msgData[id].content !== "") return;
-        if (!msgData[id]) {
-            msgData = { ...msgData, [id]: { loading: true, meta: null, content: "" } };
-        }
+    // ---------- threads: one message at a time (B) ----------
+
+    async function loadMessage(id) {
+        activeMsgId = id;
+        active = { loading: true, meta: null, content: "" };
+        openQuotes = { ...openQuotes, [id]: false };
+        if (mailPane) mailPane.scrollTop = 0;
         try {
-            const content = await fetch(`${API_URL}/email/${id}`).then(r => r.text());
-            msgData = { ...msgData, [id]: { ...msgData[id], loading: false, content } };
+            const [content, metaRes] = await Promise.all([
+                fetch(`${API_URL}/email/${id}`).then(r => r.text()),
+                fetch(`${API_URL}/email/${id}/meta`).then(r => r.ok ? r.json() : null)
+            ]);
+            if (activeMsgId !== id) return; // user already moved on
+            active = { loading: false, meta: metaRes, content };
         } catch (e) {
-            msgData = { ...msgData, [id]: { loading: false, meta: msgData[id].meta, content: "Error loading content" } };
+            if (activeMsgId === id) active = { loading: false, meta: null, content: "Error loading message" };
         }
     }
 
+    async function selectThread(t) {
+        selectedThread = t;
+        threadMsgs = [];
+        activeMsgId = null;
+        active = { loading: true, meta: null, content: "" };
+        try {
+            const res = await fetch(`${API_URL}/thread?tid=${encodeURIComponent(t.tid)}`);
+            const d = await res.json();
+            threadMsgs = d.messages;
+            if (d.messages.length) {
+                await loadMessage(d.messages[d.messages.length - 1].id);
+            }
+        } catch (e) {
+            console.error(e);
+        }
+    }
+
+    $: msgIndex = threadMsgs.findIndex(m => m.id === activeMsgId);
+
+    function stepMessage(dir) {
+        const next = msgIndex + dir;
+        if (next >= 0 && next < threadMsgs.length) {
+            loadMessage(threadMsgs[next].id);
+        }
+    }
+
+    function closeThread() {
+        selectedThread = null;
+        threadMsgs = [];
+        activeMsgId = null;
+        expanded = false;
+    }
+
+    // Quote folding for plain-text messages (HTML folds happen server-side).
     function splitQuoted(text) {
         const lines = text.split("\n");
         let first = -1;
@@ -505,42 +446,12 @@
             }
         }
         if (first < 0) return null;
-        while (first > 0 && /^(on .+ wrote:|-+ ?original message ?-+|begin forwarded message|forwarded message|__.*__)$/i.test(lines[first - 1].trim())) {
+        while (first > 0 && /^(on .+ wrote:|-+ ?original message ?-+|begin forwarded message|forwarded message)$/i.test(lines[first - 1].trim())) {
             first--;
         }
         const head = lines.slice(0, first).join("\n");
         if (!head.trim()) return null;
         return { head, quote: lines.slice(first).join("\n") };
-    }
-
-    async function selectThread(t) {
-        selectedThread = t;
-        threadMsgs = [];
-        msgData = {};
-        openMsgs = {};
-        meta = null;
-        selectedEmail = null;
-        selectedEmailContent = "";
-        try {
-            const res = await fetch(`${API_URL}/thread?tid=${encodeURIComponent(t.tid)}`);
-            const d = await res.json();
-            threadMsgs = d.messages;
-            // Load everything in parallel, then show the complete conversation
-            // in one paint — no staged pop-in, no late scroll.
-            const pairs = await Promise.all(d.messages.map(async m => {
-                const [content, metaRes] = await Promise.all([
-                    fetch(`${API_URL}/email/${m.id}`).then(r => r.text()),
-                    fetch(`${API_URL}/email/${m.id}/meta`).then(r => r.ok ? r.json() : null).catch(() => null)
-                ]);
-                return [m.id, { loading: false, meta: metaRes, content }];
-            }));
-            msgData = Object.fromEntries(pairs);
-            openMsgs = Object.fromEntries(d.messages.map(m => [m.id, true]));
-            await tick();
-            reanchor();
-        } catch (e) {
-            console.error(e);
-        }
     }
 </script>
 
@@ -586,15 +497,15 @@
 
         {#if labels.length > 0}
             <div class="labels">
-                {#each groups as g, i (String(g.head))}
-                    <div class="label-group" class:top={i === 0}>
-                        {#if g.head}<div class="nav-head">{g.head}</div>{/if}
+                {#each groups as g (g.field)}
+                    <div class="label-group">
+                        <div class="nav-head">{g.head}</div>
                         {#if g.field === 'other'}
                             {#each otherRows as r (r.full)}
                                 {#if r.hasKids && r.self}
                                     <div class="tree-row" style="padding-left: {r.depth * 0.85}rem;">
                                         <button
-                                            class="twist-btn"
+                                            class="twisty"
                                             title={r.expanded ? 'Collapse' : 'Expand'}
                                             on:click={() => toggleExpand(r.full)}
                                         >{r.expanded ? '▾' : '▸'}</button>
@@ -629,11 +540,11 @@
                             {/if}
                         {:else}
                             {#each g.items as [name, count] (name)}
-                                {@const active = sel[g.field] === name}
+                                {@const on = sel[g.field] === name}
                                 <button
                                     class="label-item"
-                                    class:on={active}
-                                    style={active && isCatTab(name)
+                                    class:on={on}
+                                    style={on && isCatTab(name)
                                         ? `background: ${withAlpha(CAT_TABS[name], 0.14)}; color: ${darken(CAT_TABS[name])}; border-left-color: ${CAT_TABS[name]};`
                                         : undefined}
                                     on:click={() => pick(g.field, name)}
@@ -667,10 +578,10 @@
             </div>
             <div class="lh-row lh-sub">
                 <span class="status">
-                    {#if loading}
+                    {#if loading && emails.length === 0}
                         Searching...
                     {:else if mode === 'search'}
-                        {emails.length} match{emails.length === 1 ? '' : 'es'}{moreSearch ? ' (newest first)' : ''}
+                        {emails.length} conversation{emails.length === 1 ? '' : 's'}
                     {:else}
                         {activeLabels().map(dispFor).join(' › ') || 'Inbox'}
                     {/if}
@@ -730,88 +641,109 @@
         </div>
     </section>
 
-    <section class="pane pane-email" bind:this={mailPane} on:scroll={onPaneScroll} class:has-email={selectedThread !== null}>
+    <section class="pane pane-email" bind:this={mailPane} class:has-email={selectedThread !== null}>
         {#if selectedThread}
-            <div class="email-tools">
-                <button class="back-btn" on:click={() => { selectedThread = null; threadMsgs = []; openMsgs = {}; msgData = {}; expanded = false; }}>Back</button>
-                <button class="fs-toggle" on:click={() => expanded = !expanded}>
-                    {expanded ? 'Restore' : 'Full screen'}
-                </button>
-            </div>
             <div class="email-view">
-                <div class="header">
-                    <h2>{selectedThread.subject || '(No Subject)'}</h2>
-                    {#if threadMsgs.length > 1}
-                        <p class="thread-count">{threadMsgs.length} messages · {fmtDateOnly(threadMsgs[0].date)} – {fmtDateOnly(threadMsgs[threadMsgs.length - 1].date)}</p>
-                    {/if}
-                </div>
-
-                {#each threadMsgs as m (m.id)}
-                    {@const mlabels = msgData[m.id]?.meta?.labels || []}
-                    <div class="tmsg" class:open={openMsgs[m.id]}>
-                        <button class="tmsg-row" on:click={() => toggleMsg(m)} title={m.from}>
-                            <span class="chev">{openMsgs[m.id] ? '▾' : '▸'}</span>
-                            <span class="who">{m.from.split(' <')[0]}</span>
-                            {#if mlabels.length}
-                                <span class="mini-labels">
-                                    {#each mlabels.slice(0, 4) as l (l)}<span class="mini">{dispFor(l)}</span>{/each}
-                                </span>
-                            {/if}
-                            {#if m.attachments}<span class="clip">📎</span>{/if}
-                            <span class="when">{fmtDateOnly(m.date)}</span>
-                        </button>
-                        {#if openMsgs[m.id]}
-                            <div class="tmsg-body">
-                                {#if !msgData[m.id] || msgData[m.id].loading}
-                                    <div class="loading">Loading message…</div>
-                                {:else}
-                                    {@const md = msgData[m.id]}
-                                    {#if md.meta && md.meta.to.length}
-                                        <p class="to-line" title={md.meta.to.join(', ')}><strong>To:</strong> {md.meta.to.map(t => t.split(' <')[0]).join(', ')}</p>
-                                    {/if}
-                                    {#if md.meta && md.meta.attachments.some(a => !a.is_inline)}
-                                        <div class="attachments">
-                                            <h3>
-                                                Attachments
-                                                {#if md.meta.inline_images}
-                                                    <span class="note">({md.meta.inline_images} image{md.meta.inline_images === 1 ? '' : 's'} also shown inline)</span>
-                                                {/if}
-                                            </h3>
-                                            {#each md.meta.attachments.filter(a => !a.is_inline) as a (a.part_index)}
-                                                <a
-                                                    class="download"
-                                                    href="{API_URL}/attachment/{m.id}/{a.part_index}"
-                                                >Download: {a.filename} ({fmtBytes(a.size)}, {a.content_type})</a>
-                                            {/each}
-                                        </div>
-                                    {/if}
-                                    {#if md.content.trim().startsWith('<')}
-                                        <iframe
-                                            class="msg-frame"
-                                            srcdoc={frameDoc(md.content, m.id)}
-                                            title="Email content"
-                                            sandbox="allow-popups allow-scripts"
-                                            scrolling="no"
-                                            style="height: {frameH[m.id] || 320}px;"
-                                        ></iframe>
-                                    {:else if splitQuoted(md.content)}
-                                        {@const q = splitQuoted(md.content)}
-                                        <pre>{q.head}</pre>
-                                        <button
-                                            class="q-toggle"
-                                            on:click={() => openQuotes = { ...openQuotes, [m.id]: !openQuotes[m.id] }}
-                                        >{openQuotes[m.id] ? 'Hide quoted text' : `Show quoted text (${q.quote.split('\n').length} lines)`}</button>
-                                        {#if openQuotes[m.id]}
-                                            <pre class="quote">{q.quote}</pre>
-                                        {/if}
-                                    {:else}
-                                        <pre>{md.content}</pre>
-                                    {/if}
-                                {/if}
-                            </div>
+                <div class="msg-head">
+                    <button class="head-btn back-btn" on:click={closeThread}>Back</button>
+                    <div class="head-titles">
+                        <h2>{selectedThread.subject || '(No Subject)'}</h2>
+                        {#if threadMsgs.length > 1}
+                            <span class="thread-count">{threadMsgs.length} messages</span>
                         {/if}
                     </div>
-                {/each}
+                    <button class="head-btn fs-toggle" on:click={() => expanded = !expanded}>
+                        {expanded ? 'Restore' : 'Full screen'}
+                    </button>
+                </div>
+
+                {#if threadMsgs.length > 1}
+                    <div class="msg-strip">
+                        {#each threadMsgs as m (m.id)}
+                            <button
+                                class="msg-chip"
+                                class:active={activeMsgId === m.id}
+                                title={m.from + ' — ' + fmtDateOnly(m.date)}
+                                on:click={() => loadMessage(m.id)}
+                            >{m.from.split(' <')[0]} · {fmtDateOnly(m.date)}{#if m.attachments} ·📎{/if}</button>
+                        {/each}
+                        <span class="strip-nav">
+                            <button
+                                class="nav-btn"
+                                title="Older message"
+                                disabled={msgIndex <= 0}
+                                on:click={() => stepMessage(-1)}
+                            >↑</button>
+                            <span class="page-count">{Math.max(1, msgIndex + 1)} / {threadMsgs.length}</span>
+                            <button
+                                class="nav-btn"
+                                title="Newer message"
+                                disabled={msgIndex >= threadMsgs.length - 1}
+                                on:click={() => stepMessage(1)}
+                            >↓</button>
+                        </span>
+                    </div>
+                {/if}
+
+                {#if active.loading}
+                    <div class="loading">Loading message…</div>
+                {:else}
+                    {@const md = active}
+                    {#if md.meta}
+                        <div class="active-info">
+                            <span class="ai-from">{md.meta.from}</span>
+                            <span class="ai-date">{fmtDate(md.meta.date)}</span>
+                        </div>
+                        {#if md.meta.to.length}
+                            <div class="active-sub" title={md.meta.to.join(', ')}>
+                                to {md.meta.to.map(t => t.split(' <')[0]).slice(0, 4).join(', ')}{md.meta.to.length > 4 ? ` +${md.meta.to.length - 4}` : ''}
+                            </div>
+                        {/if}
+                        {#if md.meta.labels.length}
+                            <div class="label-row header-labels">
+                                {#each md.meta.labels as l (l)}
+                                    <span class="chip sm">{dispFor(l)}</span>
+                                {/each}
+                            </div>
+                        {/if}
+                        {#if md.meta.attachments.some(a => !a.is_inline)}
+                            <div class="attachments">
+                                <h3>
+                                    Attachments
+                                    {#if md.meta.inline_images}
+                                        <span class="note">({md.meta.inline_images} image{md.meta.inline_images === 1 ? '' : 's'} also shown inline)</span>
+                                    {/if}
+                                </h3>
+                                {#each md.meta.attachments.filter(a => !a.is_inline) as a (a.part_index)}
+                                    <a class="download" href="{API_URL}/attachment/{activeMsgId}/{a.part_index}">
+                                        Download: {a.filename} ({fmtBytes(a.size)}, {a.content_type})
+                                    </a>
+                                {/each}
+                            </div>
+                        {/if}
+                    {/if}
+
+                    {#if md.content.trim().startsWith('<')}
+                        <iframe
+                            class="msg-frame"
+                            srcdoc={md.content}
+                            title="Email content"
+                            sandbox="allow-popups"
+                        ></iframe>
+                    {:else if splitQuoted(md.content)}
+                        {@const q = splitQuoted(md.content)}
+                        <pre>{q.head}</pre>
+                        <button
+                            class="q-toggle"
+                            on:click={() => openQuotes = { ...openQuotes, [activeMsgId]: !openQuotes[activeMsgId] }}
+                        >{openQuotes[activeMsgId] ? 'Hide quoted text' : `Show quoted text (${q.quote.split('\n').length} lines)`}</button>
+                        {#if openQuotes[activeMsgId]}
+                            <pre class="quote">{q.quote}</pre>
+                        {/if}
+                    {:else}
+                        <pre>{md.content}</pre>
+                    {/if}
+                {/if}
             </div>
         {:else}
             <div class="placeholder">
@@ -857,10 +789,31 @@
         flex-direction: column;
         position: relative;
     }
-    .pane-settings h1 {
-        padding: 0;
+    .title-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 1rem 1rem 0.4rem;
+    }
+    .title-row h1 {
         margin: 0;
-        font-size: 1.1rem;
+        font-size: 1.05rem;
+    }
+    .gear {
+        text-decoration: none;
+        display: inline-block;
+        border: none;
+        background: transparent;
+        font-size: 1.15rem;
+        line-height: 1;
+        cursor: pointer;
+        padding: 0.3rem 0.45rem;
+        margin-right: -0.45rem;
+        border-radius: 4px;
+        color: #444;
+    }
+    .gear:hover {
+        background: #e2e2e2;
     }
     .pane-results {
         background: #f7f7f7;
@@ -929,180 +882,6 @@
     .pane-email {
         background: white;
     }
-    .title-row {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 1rem 1rem 0.4rem;
-    }
-    .gear {
-        text-decoration: none;
-        display: inline-block;
-        border: none;
-        background: transparent;
-        font-size: 1.15rem;
-        line-height: 1;
-        cursor: pointer;
-        padding: 0.3rem 0.45rem;
-        margin-right: -0.45rem;
-        border-radius: 4px;
-        color: #444;
-    }
-    .gear:hover {
-        background: #e2e2e2;
-    }
-    .burger {
-        display: none;
-        border: none;
-        background: transparent;
-        font-size: 1.05rem;
-        cursor: pointer;
-        padding: 0.1rem 0.35rem;
-        border-radius: 4px;
-        color: #333;
-    }
-    .burger:hover {
-        background: #eee;
-    }
-    .drawer-backdrop {
-        display: none;
-        position: fixed;
-        inset: 0;
-        background: rgba(0, 0, 0, 0.35);
-        border: none;
-        z-index: 55;
-    }
-    .back-btn {
-        margin-right: auto;
-    }
-    .bodies {
-        font-size: 0.75rem;
-        color: #555;
-        display: flex;
-        align-items: center;
-        gap: 0.3rem;
-        flex-basis: 100%;
-    }
-    .labels {
-        padding: 0 0 0.2rem;
-    }
-    .label-group {
-        margin: 0 1rem 0.45rem;
-        border: 1px solid #e2e2e2;
-        border-radius: 4px;
-        background: white;
-        overflow: hidden;
-    }
-    .nav-head {
-        font-size: 0.66rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: #888;
-        padding: 0.35rem 0.7rem 0.2rem;
-        background: #fafafa;
-        border-bottom: 1px solid #f0f0f0;
-    }
-    .label-group.top .lname {
-        font-weight: 600;
-    }
-    .show-more .lname {
-        color: #06c;
-        font-size: 0.75rem;
-    }
-    .label-item {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        width: 100%;
-        padding: 0.3rem 0.7rem;
-        font-size: 0.8rem;
-        border: none;
-        border-bottom: 1px solid #f0f0f0;
-        background: transparent;
-        cursor: pointer;
-        text-align: left;
-    }
-    .label-item:hover {
-        background: #f0f0f0;
-    }
-    .cat-dot {
-        display: inline-block;
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        margin-right: 0.45rem;
-        vertical-align: middle;
-    }
-    .label-item.parent .lname {
-        font-weight: 600;
-        color: #333;
-    }
-    .twist {
-        display: inline-block;
-        width: 1rem;
-        color: #888;
-        font-size: 0.7rem;
-    }
-    .tree-row {
-        display: flex;
-        align-items: stretch;
-        border-bottom: 1px solid #f0f0f0;
-    }
-    .twist-btn {
-        border: none;
-        background: transparent;
-        color: #888;
-        font-size: 0.7rem;
-        padding: 0 0.3rem 0 0.55rem;
-        cursor: pointer;
-        align-self: center;
-    }
-    .twist-btn:hover {
-        color: #333;
-    }
-    .label-item.inline {
-        flex: 1;
-        border-bottom: none;
-        min-width: 0;
-    }
-    .label-item.on {
-        background: #d3e3fd;
-        color: #1c3aa9;
-        font-weight: 600;
-        border-left: 3px solid #1a73e8;
-        padding-left: 0.45rem;
-    }
-    .label-item.on .lname::before {
-        content: "✓ ";
-        color: currentColor;
-    }
-    .label-item .count {
-        opacity: 0.55;
-        font-size: 0.72rem;
-    }
-    .label-row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 0.3rem;
-    }
-    .header-labels {
-        margin-top: 0.5rem;
-    }
-    .chip {
-        font-size: 0.72rem;
-        padding: 0.15rem 0.5rem;
-        border: 1px solid #bbb;
-        border-radius: 10px;
-        background: white;
-        cursor: pointer;
-    }
-    .chip.sm {
-        cursor: default;
-        background: #eef;
-    }
-    .chip .count {
-        opacity: 0.6;
-    }
     .dateslider {
         padding: 0.4rem 1rem;
     }
@@ -1153,7 +932,7 @@
         border-radius: 50%;
         background: #333;
         border: 2px solid white;
-        box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
         cursor: ew-resize;
     }
     .range-pair input[type="range"]::-moz-range-thumb {
@@ -1171,10 +950,113 @@
         align-items: center;
         justify-content: space-between;
     }
+    .bodies {
+        font-size: 0.75rem;
+        color: #555;
+        display: flex;
+        align-items: center;
+        gap: 0.3rem;
+        flex-basis: 100%;
+    }
     .clear {
         font-size: 0.75rem;
         padding: 0.2rem 0.5rem;
         cursor: pointer;
+    }
+    .labels {
+        padding: 0 0 0.2rem;
+    }
+    .label-group {
+        margin: 0 1rem 0.45rem;
+        border: 1px solid #e2e2e2;
+        border-radius: 4px;
+        background: white;
+        overflow: hidden;
+    }
+    .nav-head {
+        font-size: 0.66rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: #888;
+        padding: 0.35rem 0.7rem 0.2rem;
+        background: #fafafa;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .label-item {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        width: 100%;
+        padding: 0.3rem 0.7rem;
+        font-size: 0.8rem;
+        border: none;
+        border-bottom: 1px solid #f0f0f0;
+        background: transparent;
+        cursor: pointer;
+        text-align: left;
+    }
+    .label-item:hover {
+        background: #f0f0f0;
+    }
+    .label-item.on {
+        background: #d3e3fd;
+        color: #1c3aa9;
+        font-weight: 600;
+        border-left: 3px solid #1a73e8;
+        padding-left: 0.45rem;
+    }
+    .label-item.on .lname::before {
+        content: "✓ ";
+        color: currentColor;
+    }
+    .label-item .count {
+        opacity: 0.55;
+        font-size: 0.72rem;
+        margin-left: 0.4rem;
+    }
+    .cat-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 0.45rem;
+        vertical-align: middle;
+    }
+    .label-item.parent .lname {
+        font-weight: 600;
+        color: #333;
+    }
+    .twist {
+        display: inline-block;
+        width: 1rem;
+        color: #888;
+        font-size: 0.7rem;
+    }
+    .tree-row {
+        display: flex;
+        align-items: stretch;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    .twisty {
+        border: none;
+        background: transparent;
+        color: #888;
+        font-size: 0.7rem;
+        padding: 0 0.3rem 0 0.55rem;
+        cursor: pointer;
+        align-self: center;
+    }
+    .twisty:hover {
+        color: #333;
+    }
+    .label-item.inline {
+        flex: 1;
+        border-bottom: none;
+        min-width: 0;
+    }
+    .show-more .lname {
+        color: #06c;
+        font-size: 0.75rem;
     }
     .email-list {
         flex: 1;
@@ -1217,83 +1099,6 @@
         font-weight: 600;
         vertical-align: middle;
     }
-    .thread-count {
-        color: #777;
-        font-size: 0.8rem;
-        margin: 0.2rem 0 0;
-    }
-    .tmsg {
-        border-top: 1px solid #eee;
-    }
-    .tmsg:last-child {
-        border-bottom: 1px solid #eee;
-    }
-    .tmsg-row {
-        display: flex;
-        align-items: center;
-        gap: 0.5rem;
-        width: 100%;
-        padding: 0.4rem 0.2rem;
-        background: transparent;
-        border: none;
-        cursor: pointer;
-        font-size: 0.85rem;
-        text-align: left;
-    }
-    .tmsg-row:hover {
-        background: #f5f7fa;
-    }
-    .tmsg.open > .tmsg-row {
-        background: #e8f0fe;
-    }
-    .chev {
-        color: #888;
-        width: 0.7rem;
-        flex-shrink: 0;
-    }
-    .who {
-        font-weight: 600;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        max-width: 40%;
-    }
-    .mini-labels {
-        display: inline-flex;
-        gap: 0.25rem;
-        overflow: hidden;
-    }
-    .mini {
-        font-size: 0.66rem;
-        color: #666;
-        background: #eceff1;
-        border-radius: 7px;
-        padding: 0.02rem 0.4rem;
-        white-space: nowrap;
-    }
-    .when {
-        margin-left: auto;
-        color: #777;
-        font-size: 0.75rem;
-        white-space: nowrap;
-    }
-    .tmsg-body {
-        padding: 0.1rem 0.2rem 0.9rem;
-    }
-    .to-line {
-        margin: 0 0 0.4rem;
-        font-size: 0.78rem;
-        color: #555;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-    .msg-frame {
-        width: 100%;
-        border: none;
-        background: #fff;
-        overflow: hidden;
-    }
     .meta {
         font-size: 0.8rem;
         color: #666;
@@ -1310,54 +1115,169 @@
     .date {
         white-space: nowrap;
     }
+    .load-more {
+        padding: 1rem;
+        text-align: center;
+    }
+    .load-more button {
+        padding: 0.5rem 1rem;
+        cursor: pointer;
+    }
+    .load-more .recheck {
+        font-size: 0.72rem;
+        color: #888;
+        margin-top: 0.3rem;
+    }
     .email-view {
-        padding: 1.5rem 2rem;
+        padding: 0 2rem 1.5rem;
     }
-    .email-tools {
+    .msg-head {
+        position: sticky;
+        top: 0;
+        z-index: 6;
+        background: #fff;
         display: flex;
-        justify-content: flex-end;
-        padding: 0.6rem 1rem 0;
+        align-items: center;
+        gap: 0.7rem;
+        padding: 0.55rem 2rem;
+        margin: 0 -2rem 0.6rem;
+        border-bottom: 1px solid #eee;
     }
-    .email-tools button {
-        font-size: 0.75rem;
-        padding: 0.25rem 0.8rem;
+    .head-btn {
+        flex-shrink: 0;
+        font-size: 0.72rem;
+        padding: 0.22rem 0.65rem;
         cursor: pointer;
         border: 1px solid #bbb;
         border-radius: 4px;
         background: white;
     }
-    .email-view .header {
-        border-bottom: 1px solid #eee;
-        padding-bottom: 1rem;
-        margin-bottom: 1rem;
+    .head-titles {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        align-items: baseline;
+        gap: 0.7rem;
     }
-    .email-view pre {
-        white-space: pre-wrap;
-        font-family: monospace;
-        background: #f9f9f9;
-        padding: 1rem;
-        border-radius: 4px;
-        font-size: 0.9rem;
+    .msg-head h2 {
+        margin: 0;
+        font-size: 1.02rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
     }
-    .q-toggle {
-        border: none;
-        background: transparent;
-        color: #06c;
-        font-size: 0.8rem;
+    .thread-count {
+        color: #888;
+        font-size: 0.72rem;
+        white-space: nowrap;
+        flex-shrink: 0;
+    }
+    .msg-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.3rem;
+        margin-bottom: 0.7rem;
+    }
+    .msg-chip {
+        border: 1px solid #ddd;
+        background: #fafafa;
+        border-radius: 14px;
+        font-size: 0.74rem;
+        padding: 0.18rem 0.6rem;
         cursor: pointer;
-        padding: 0.2rem 0;
-        text-align: left;
+        color: #555;
+        white-space: nowrap;
     }
-    pre.quote {
-        opacity: 0.8;
-        border-left: 3px solid #ddd;
+    .msg-chip:hover {
+        background: #eee;
+    }
+    .msg-chip.active {
+        background: #d3e3fd;
+        border-color: #a9c8f5;
+        color: #1c3aa9;
+        font-weight: 600;
+    }
+    .strip-nav {
+        margin-left: auto;
+        display: flex;
+        gap: 0.25rem;
+    }
+    .nav-btn {
+        width: 1.9rem;
+        height: 1.75rem;
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        background: white;
+        cursor: pointer;
+        font-size: 0.95rem;
+        line-height: 1;
+        color: #555;
+    }
+    .nav-btn:hover:not(:disabled) {
+        background: #eee;
+    }
+    .nav-btn:disabled {
+        opacity: 0.35;
+        cursor: default;
+    }
+    .page-count {
+        font-size: 0.75rem;
+        color: #666;
+        min-width: 3rem;
+        text-align: center;
+        line-height: 1.75rem;
+        font-variant-numeric: tabular-nums;
+    }
+    .active-info {
+        display: flex;
+        align-items: baseline;
+        gap: 0.7rem;
+        font-size: 0.85rem;
+        margin-bottom: 0.1rem;
+    }
+    .ai-from {
+        font-weight: 600;
+    }
+    .ai-date {
+        margin-left: auto;
+        color: #777;
+        font-size: 0.75rem;
+        white-space: nowrap;
+    }
+    .active-sub {
+        font-size: 0.78rem;
+        color: #666;
+        margin-bottom: 0.3rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .label-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.3rem;
+    }
+    .header-labels {
+        margin: 0.2rem 0 0.5rem;
+    }
+    .chip.sm {
+        cursor: default;
+        background: #eef;
+    }
+    .chip {
+        font-size: 0.72rem;
+        padding: 0.15rem 0.5rem;
+        border: 1px solid #bbb;
+        border-radius: 10px;
+        background: white;
     }
     .attachments {
         border: 1px solid #ddd;
         border-radius: 4px;
         background: #fafafa;
         padding: 0.5rem 1rem;
-        margin-bottom: 1rem;
+        margin-bottom: 0.8rem;
     }
     .attachments h3 {
         margin: 0.3rem 0;
@@ -1374,6 +1294,39 @@
         font-size: 0.85rem;
         color: #06c;
     }
+    .msg-frame {
+        width: 100%;
+        height: 65vh;
+        border: 1px solid #eee;
+        border-radius: 6px;
+        background: white;
+    }
+    .email-expanded .msg-frame {
+        height: calc(100vh - 220px);
+    }
+    .email-view pre {
+        white-space: pre-wrap;
+        overflow-wrap: break-word;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        font-size: 0.92rem;
+        line-height: 1.55;
+        background: transparent;
+        padding: 0.4rem 0.2rem;
+        margin: 0;
+    }
+    .q-toggle {
+        border: none;
+        background: transparent;
+        color: #06c;
+        font-size: 0.8rem;
+        cursor: pointer;
+        padding: 0.2rem 0;
+        text-align: left;
+    }
+    pre.quote {
+        opacity: 0.8;
+        border-left: 3px solid #ddd;
+    }
     .placeholder {
         color: #999;
         text-align: center;
@@ -1388,51 +1341,12 @@
         margin-left: 0.5rem;
         cursor: pointer;
     }
-    .load-more {
-        padding: 1rem;
-        text-align: center;
-    }
-    .load-more button {
-        padding: 0.5rem 1rem;
-        cursor: pointer;
-    }
-    .load-more .recheck {
-        font-size: 0.72rem;
-        color: #888;
-        margin-top: 0.3rem;
-    }
     @media (min-width: 901px) {
         .back-btn {
             display: none;
         }
     }
-    @media (min-width: 641px) and (max-width: 900px) {
-        .container {
-            grid-template-columns: 270px 1fr;
-        }
-        .container.email-expanded {
-            grid-template-columns: 270px 1fr;
-        }
-        .email-expanded .pane-settings,
-        .email-expanded .pane-results {
-            display: flex;
-        }
-    }
     @media (max-width: 900px) {
-        .pane-email {
-            position: fixed;
-            inset: 0;
-            height: 100vh;
-            overflow-y: auto;
-            z-index: 50;
-            background: white;
-        }
-        .pane-email:not(.has-email) {
-            display: none;
-        }
-        .pane-email .email-view {
-            padding: 0 1.4rem;
-        }
         .fs-toggle {
             display: none;
         }
@@ -1441,6 +1355,13 @@
         .container {
             grid-template-columns: 1fr;
             grid-template-rows: auto 1fr;
+        }
+        .container.email-expanded {
+            grid-template-columns: 1fr;
+        }
+        .email-expanded .pane-settings,
+        .email-expanded .pane-results {
+            display: flex;
         }
         .pane {
             height: auto;
@@ -1488,10 +1409,42 @@
             display: none;
         }
         .pane-email .email-view {
-            padding: 0 1.4rem;
+            padding: 0 1.4rem 1rem;
         }
-        .fs-toggle {
-            display: none;
+        .msg-head {
+            margin-left: -1.4rem;
+            margin-right: -1.4rem;
+            padding-left: 1.4rem;
+            padding-right: 1.4rem;
         }
+        .msg-frame {
+            height: calc(100vh - 260px);
+            min-height: 300px;
+        }
+        .body iframe {
+            height: calc(100vh - 230px);
+            min-height: 300px;
+        }
+    }
+    .burger {
+        display: none;
+        border: none;
+        background: transparent;
+        font-size: 1.05rem;
+        cursor: pointer;
+        padding: 0.1rem 0.35rem;
+        border-radius: 4px;
+        color: #333;
+    }
+    .burger:hover {
+        background: #eee;
+    }
+    .drawer-backdrop {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.35);
+        border: none;
+        z-index: 55;
     }
 </style>
