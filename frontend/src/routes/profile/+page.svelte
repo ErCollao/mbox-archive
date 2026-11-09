@@ -6,6 +6,10 @@
     let err = "";
     let note = "";
 
+    // name form
+    let displayName = "";
+    let savingName = false;
+
     // password form
     let cur = "", next = "", again = "";
     let saving = false;
@@ -14,6 +18,7 @@
         const res = await fetch('/api/profile');
         if (res.status === 401) { window.location.href = '/welcome'; return; }
         me = await res.json();
+        displayName = me.name;
         bust = Date.now();
     }
     onMount(load);
@@ -56,6 +61,25 @@
         flash("Photo removed.");
     }
 
+    async function saveName() {
+        err = note = "";
+        savingName = true;
+        try {
+            const res = await fetch('/api/profile/name', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ name: displayName })
+            });
+            const out = await res.json();
+            if (!res.ok) return flash(out.error || "Could not save the name.", true);
+            me = { ...me, name: out.name };
+            displayName = out.name;
+            flash("Name updated.");
+        } finally {
+            savingName = false;
+        }
+    }
+
     async function changePassword() {
         err = note = "";
         if (next !== again) return flash("The two new passwords don't match.", true);
@@ -95,6 +119,27 @@
         {#if err || note}
             <div class="msg" class:bad={err} class:good={note}>{err || note}</div>
         {/if}
+
+        <section>
+            <h2>Name</h2>
+            <p class="hint">How you're labelled on the sign-in screen and in the archive corner. Changing it signs nobody out.</p>
+            <div class="fields">
+                <input
+                    type="text"
+                    bind:value={displayName}
+                    placeholder="Display name"
+                    maxlength="80"
+                    on:keydown={(e) => e.key === 'Enter' && saveName()}
+                />
+            </div>
+            <button
+                class="btn"
+                on:click={saveName}
+                disabled={savingName || !displayName.trim() || displayName.trim() === me.name}
+            >
+                {savingName ? "Saving…" : "Save name"}
+            </button>
+        </section>
 
         <section>
             <h2>Photo</h2>

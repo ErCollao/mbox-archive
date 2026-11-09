@@ -660,6 +660,7 @@ fn build_app(root: Root) -> Router {
         .route("/api/whoami", get(whoami))
         .route("/api/profile", get(profile_info))
         .route("/api/profile/password", post(change_password))
+        .route("/api/profile/name", post(change_name))
         .route("/api/profile/portrait", post(upload_portrait).delete(delete_portrait))
         .route("/api/scan", post(scan_handler))
         .route("/api/merge", post(merge_handler))
@@ -1447,14 +1448,15 @@ struct ProfileOut {
 }
 
 /// Chooser data — intentionally the only roster view available pre-login.
+/// Read fresh off disk so renames show up without a restart.
 async fn list_profiles(State(root): State<Root>) -> Json<Vec<ProfileOut>> {
     Json(
-        root.tenants
-            .values()
-            .map(|t| ProfileOut {
-                slug: t.slug.clone(),
-                name: t.name.clone(),
-                has_portrait: auth::find_portrait(&root.profiles_dir, &t.slug).is_some(),
+        auth::load_profiles(&root.profiles_dir)
+            .into_iter()
+            .map(|p| ProfileOut {
+                slug: p.slug.clone(),
+                name: p.name,
+                has_portrait: auth::find_portrait(&root.profiles_dir, &p.slug).is_some(),
             })
             .collect(),
     )
@@ -1525,8 +1527,16 @@ async fn logout_handler() -> Response {
         .into_response()
 }
 
-async fn whoami(Extension(t): Extension<Tenant>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "slug": t.slug, "name": t.name }))
+/// Display name, read fresh from disk so a rename applies without a restart.
+/// Falls back to the boot-time name if the profile can't be read.
+fn display_name(root: &Root, t: &Tenant) -> String {
+    auth::read_profile(&root.profiles_dir, &t.slug)
+        .map(|sp| sp.name)
+        .unwrap_or_else(|| t.name.clone())
+}
+
+async fn whoami(State(root): State<Root>, Extension(t): Extension<Tenant>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "slug": t.slug, "name": display_name(&root, &t) }))
 }
 
 static SLUG_OK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
@@ -1615,6 +1625,38 @@ async fn change_password(
 }
 
 #[derive(Deserialize)]
+struct NameIn {
+    name: String,
+}
+
+/// Display-name edit. The stored secret is rewritten verbatim, so neither the
+/// session epoch nor anyone's cookie is touched — a rename logs nobody out.
+async fn change_name(
+    State(root): State<Root>,
+    Extension(t): Extension<Tenant>,
+    Json(b): Json<NameIn>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let bad = |code: StatusCode, msg: &str| {
+        (code, Json(serde_json::json!({ "error": msg })))
+    };
+    let name = b.name.trim();
+    if name.is_empty() || name.chars().count() > 80 {
+        return Err(bad(StatusCode::BAD_REQUEST, "name needs 1–80 characters"));
+    }
+    let stored = auth::read_profile(&root.profiles_dir, &t.slug).ok_or_else(|| {
+        bad(StatusCode::NOT_FOUND, "profile file is missing")
+    })?;
+    auth::write_profile(&root.profiles_dir, &t.slug, name, &stored.secret).map_err(|e| {
+        bad(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not save: {}", e),
+        )
+    })?;
+    info!("display name set to '{}' for '{}'", name, t.slug);
+    Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+}
+
+#[derive(Deserialize)]
 struct PortraitIn {
     /// data URL or bare base64 of the image bytes
     data: String,
@@ -1673,7 +1715,7 @@ async fn profile_info(
 ) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "slug": t.slug,
-        "name": t.name,
+        "name": display_name(&root, &t),
         "has_portrait": auth::find_portrait(&root.profiles_dir, &t.slug).is_some(),
     }))
 }
@@ -1918,5 +1960,73 @@ mod integration_tests {
         assert_eq!(r.status(), StatusCode::OK);
         let sc = r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
         assert!(sc.contains("Max-Age=0"));
+    }
+
+    async fn get_json(app: &Router, uri: &str, cookie: Option<&str>) -> (StatusCode, serde_json::Value) {
+        let r = send(app, req("GET", uri, Body::empty(), cookie, false)).await;
+        let status = r.status();
+        (status, json_of(r).await)
+    }
+
+    #[tokio::test]
+    async fn rename_updates_all_views_without_touching_sessions() {
+        let env = Env::new("rename");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        let r = login(&app, "daniel", "daniel").await;
+        let cookie = cookie_of(&r);
+        let secret_before = auth::read_profile(&env.profiles, "daniel").unwrap().secret;
+
+        let changed = send(
+            &app,
+            req(
+                "POST",
+                "/api/profile/name",
+                Body::from(json!({ "name": "  Dan  " }).to_string()),
+                Some(&cookie),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::OK);
+
+        let (s, body) = get_json(&app, "/api/whoami", Some(&cookie)).await;
+        assert_eq!(s, StatusCode::OK, "renamed device keeps its session");
+        assert_eq!(body["name"], "Dan", "whoami shows trimmed new name");
+        let (_, prof) = get_json(&app, "/api/profile", Some(&cookie)).await;
+        assert_eq!(prof["name"], "Dan");
+        let (s, roster) = get_json(&app, "/api/profiles", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(roster[0]["name"], "Dan", "chooser reads new name pre-login");
+
+        assert_eq!(
+            auth::read_profile(&env.profiles, "daniel").unwrap().secret,
+            secret_before,
+            "rename must not alter the secret"
+        );
+        assert_eq!(login(&app, "daniel", "daniel").await.status(), StatusCode::OK, "old password still works");
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_blank_and_overlong_names() {
+        let env = Env::new("badname");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+        for name in ["", "   ", &"x".repeat(81)] {
+            let r = send(
+                &app,
+                req(
+                    "POST",
+                    "/api/profile/name",
+                    Body::from(json!({ "name": name }).to_string()),
+                    Some(&cookie),
+                    true,
+                ),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "accepted name {:?}", name);
+        }
+        assert_eq!(auth::read_profile(&env.profiles, "daniel").unwrap().name, "Daniel");
     }
 }
