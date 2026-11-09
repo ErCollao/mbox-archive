@@ -3,6 +3,7 @@ services:
     build: ./backend
     # No ports exposed to host, only accessible within docker network
     volumes:
+      - ${PROFILES_DIR:-./profiles}:/profiles
       - ${DATA_DIR:-./data}:/data
       - ${ARCHIVE_DIR:-./archive}:/archive
       - ${BACKUP_DIR:-./backup}:/backup

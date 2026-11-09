@@ -1,7 +1,10 @@
+mod auth;
+
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Json},
+    middleware,
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -30,14 +33,27 @@ use tower_http::cors::CorsLayer;
 use walkdir::WalkDir;
 use tracing::{info, error, warn};
 
+/// One person's archive: everything handlers used to share globally is now
+/// scoped to a tenant. Handlers receive it via Extension after cookie auth.
 #[derive(Clone)]
-struct AppState {
+struct Tenant {
+    slug: String,
+    name: String,
+    secret_hex: String,
     inner: Arc<RwLock<AppStateInner>>,
     data_dir: PathBuf,
     archive_dir: PathBuf,
     backup_dir: PathBuf,
     busy: Arc<AtomicBool>,
     backup: Arc<Mutex<BackupProgress>>,
+}
+
+/// Global state: the tenant map plus everything the auth layer needs.
+#[derive(Clone)]
+struct Root {
+    tenants: Arc<HashMap<String, Tenant>>,
+    profiles_dir: PathBuf,
+    key: Arc<Vec<u8>>,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -48,6 +64,7 @@ struct BackupProgress {
     total: u64,
 }
 
+#[derive(Default)]
 struct AppStateInner {
     mbox_path: Option<PathBuf>,
     entries: Vec<MailEntry>,
@@ -563,39 +580,55 @@ async fn main() {
         )
         .init();
 
-    let data_dir = PathBuf::from("/data");
-    fs::create_dir_all(&data_dir).unwrap();
-    let backup_dir = PathBuf::from(
+    let profiles_dir = PathBuf::from(
+        std::env::var("PROFILES_DIR").unwrap_or_else(|_| "/profiles".to_string()),
+    );
+    let data_root = PathBuf::from(
+        std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".to_string()),
+    );
+    let backup_root = PathBuf::from(
         std::env::var("BACKUP_DIR").unwrap_or_else(|_| "/backup".to_string()),
     );
-    let archive_dir = PathBuf::from(
+    let archive_root = PathBuf::from(
         std::env::var("ARCHIVE_DIR").unwrap_or_else(|_| "/archive".to_string()),
     );
 
-    let state = AppState {
-        inner: Arc::new(RwLock::new(AppStateInner {
-            mbox_path: None,
-            entries: Vec::new(),
-            order: Vec::new(),
-            facets: Facets::default(),
-            threads: Vec::new(),
-            thread_order: Vec::new(),
-            tmap: HashMap::new(),
-        })),
-        data_dir,
-        archive_dir,
-        backup_dir,
-        busy: Arc::new(AtomicBool::new(false)),
-        backup: Arc::new(Mutex::new(BackupProgress::default())),
-    };
-
-    // Auto-load the persistent index on boot so browsing works immediately.
-    {
-        let s = state.clone();
-        tokio::spawn(async move { let _ = scan_handler(State(s)).await; });
+    // Fail closed: no roster, no startup. An archive that boots anonymous
+    // is an archive with no doors, and silent-empty would look like data loss.
+    let profiles = auth::load_profiles(&profiles_dir);
+    if profiles.is_empty() {
+        panic!(
+            "No valid profiles found under {:?}. Create profiles/<slug>/profile.json \
+             (see README) — refusing to start without at least one authenticated tenant.",
+            profiles_dir
+        );
     }
+    let key = Arc::new(auth::session_key(&archive_root.join("session.key")));
 
-    let app = Router::new()
+    let mut tenants = HashMap::new();
+    for p in profiles {
+        let _ = fs::create_dir_all(data_root.join(&p.slug));
+        let t = Tenant {
+            slug: p.slug.clone(),
+            name: p.name.clone(),
+            secret_hex: p.secret_hex,
+            inner: Arc::new(RwLock::new(AppStateInner::default())),
+            data_dir: data_root.join(&p.slug),
+            archive_dir: archive_root.join(&p.slug),
+            backup_dir: backup_root.join(&p.slug),
+            busy: Arc::new(AtomicBool::new(false)),
+            backup: Arc::new(Mutex::new(BackupProgress::default())),
+        };
+        info!("tenant '{}': archive {:?}", t.name, t.archive_dir);
+        // Auto-index on boot so browsing works immediately, per tenant.
+        let tt = t.clone();
+        tokio::spawn(async move { let _ = scan_handler(Extension(tt)).await; });
+        tenants.insert(p.slug.clone(), t);
+    }
+    let root = Root { tenants: Arc::new(tenants), profiles_dir, key };
+
+    let protected = Router::new()
+        .route("/api/whoami", get(whoami))
         .route("/api/scan", post(scan_handler))
         .route("/api/merge", post(merge_handler))
         .route("/api/filters", get(filters_handler))
@@ -607,15 +640,23 @@ async fn main() {
         .route("/api/attachment/:id/:part", get(get_attachment_data))
         .route("/api/status", get(status_handler))
         .route("/api/backup", post(backup_handler))
+        .layer(middleware::from_fn_with_state(root.clone(), require_tenant));
+
+    let app = Router::new()
+        .route("/api/profiles", get(list_profiles))
+        .route("/api/login", post(login_handler))
+        .route("/api/logout", post(logout_handler))
+        .route("/profiles/:slug/portrait", get(portrait_handler))
+        .merge(protected)
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(root);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     info!("Server running on port 3000");
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
+async fn merge_handler(Extension(state): Extension<Tenant>) -> Json<ScanResponse> {
     let data_dir = state.data_dir.clone();
     let archive_dir = state.archive_dir.clone();
     state.busy.store(true, Ordering::SeqCst);
@@ -750,7 +791,7 @@ async fn merge_handler(State(state): State<AppState>) -> Json<ScanResponse> {
     })
 }
 
-async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
+async fn scan_handler(Extension(state): Extension<Tenant>) -> Json<ScanResponse> {
     let inner = state.inner.clone();
     let data_dir = state.data_dir.clone();
     let archive_dir = state.archive_dir.clone();
@@ -825,7 +866,7 @@ async fn scan_handler(State(state): State<AppState>) -> Json<ScanResponse> {
 }
 
 async fn filters_handler(
-    State(state): State<AppState>,
+    Extension(state): Extension<Tenant>,
     Query(params): Query<FilterParams>,
 ) -> Json<Facets> {
     let inner = state.inner.clone();
@@ -885,7 +926,7 @@ async fn filters_handler(
 }
 
 async fn list_messages(
-    State(state): State<AppState>,
+    Extension(state): Extension<Tenant>,
     Query(params): Query<FilterParams>,
 ) -> Json<Vec<ThreadOut>> {
     let inner = state.inner.clone();
@@ -955,7 +996,7 @@ struct TidParam {
     tid: String,
 }
 
-async fn thread_detail(State(state): State<AppState>, Query(q): Query<TidParam>) -> impl IntoResponse {
+async fn thread_detail(Extension(state): Extension<Tenant>, Query(q): Query<TidParam>) -> impl IntoResponse {
     let lock = state.inner.read().unwrap();
     match lock.tmap.get(&q.tid) {
         Some(&ti) => {
@@ -972,7 +1013,7 @@ async fn thread_detail(State(state): State<AppState>, Query(q): Query<TidParam>)
 }
 
 async fn search_handler(
-    State(state): State<AppState>,
+    Extension(state): Extension<Tenant>,
     Query(params): Query<FilterParams>,
 ) -> Json<Vec<ThreadOut>> {
     let inner = state.inner.clone();
@@ -1036,7 +1077,7 @@ async fn search_handler(
 }
 
 async fn get_email_content(
-    State(state): State<AppState>,
+    Extension(state): Extension<Tenant>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let idx: usize = match id.parse() {
@@ -1090,7 +1131,7 @@ async fn get_email_content(
     }
 }
 
-async fn email_meta(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn email_meta(Extension(state): Extension<Tenant>, Path(id): Path<String>) -> impl IntoResponse {
     let inner = state.inner.clone();
     let out = tokio::task::spawn_blocking(move || -> Option<EmailMetaOut> {
         let idx = id.parse::<usize>().ok()?;
@@ -1139,7 +1180,7 @@ async fn email_meta(State(state): State<AppState>, Path(id): Path<String>) -> im
 }
 
 async fn get_attachment_data(
-    State(state): State<AppState>,
+    Extension(state): Extension<Tenant>,
     Path((id, part)): Path<(String, usize)>,
 ) -> impl IntoResponse {
     let inner = state.inner.clone();
@@ -1195,7 +1236,7 @@ struct StatusOut {
     backup: BackupProgress,
 }
 
-async fn status_handler(State(state): State<AppState>) -> Json<StatusOut> {
+async fn status_handler(Extension(state): Extension<Tenant>) -> Json<StatusOut> {
     let lock = state.inner.read().unwrap();
     Json(StatusOut {
         busy: state.busy.load(Ordering::SeqCst),
@@ -1222,7 +1263,7 @@ struct BackupOut {
 /// Safe copy of the current archive, gzip-compressed: written to a temp file
 /// with progress reporting, verified by full decompression, then atomically
 /// renamed — a partial or corrupt backup never appears as a completed one.
-async fn backup_handler(State(state): State<AppState>) -> Json<BackupOut> {
+async fn backup_handler(Extension(state): Extension<Tenant>) -> Json<BackupOut> {
     let fail = |m: String| {
         Json(BackupOut {
             ok: false,
@@ -1329,5 +1370,131 @@ async fn backup_handler(State(state): State<AppState>) -> Json<BackupOut> {
         }),
         Ok(Err(msg)) => fail(msg),
         Err(_) => fail("Backup task was aborted.".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tenancy: authentication endpoints and the per-request tenant layer.
+// ---------------------------------------------------------------------------
+
+/// Rejects requests without a valid session cookie; otherwise injects the
+/// matching Tenant for handlers to extract.
+async fn require_tenant(
+    State(root): State<Root>,
+    mut req: axum::extract::Request,
+    next: middleware::Next,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    let cookie = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| auth::extract_cookie(h, auth::COOKIE_NAME));
+    let tenant = cookie
+        .as_deref()
+        .and_then(|c| auth::verify_session(&root.key, c, Utc::now().timestamp()))
+        .and_then(|(slug, _)| root.tenants.get(&slug).cloned());
+    match tenant {
+        Some(t) => {
+            req.extensions_mut().insert(t);
+            Ok(next.run(req).await)
+        }
+        None => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )),
+    }
+}
+
+#[derive(Serialize)]
+struct ProfileOut {
+    slug: String,
+    name: String,
+    has_portrait: bool,
+}
+
+/// Chooser data — intentionally the only roster view available pre-login.
+async fn list_profiles(State(root): State<Root>) -> Json<Vec<ProfileOut>> {
+    Json(
+        root.tenants
+            .values()
+            .map(|t| ProfileOut {
+                slug: t.slug.clone(),
+                name: t.name.clone(),
+                has_portrait: auth::find_portrait(&root.profiles_dir, &t.slug).is_some(),
+            })
+            .collect(),
+    )
+}
+
+#[derive(Deserialize)]
+struct LoginIn {
+    slug: String,
+    password: String,
+}
+
+async fn login_handler(
+    State(root): State<Root>,
+    Json(body): Json<LoginIn>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    let tenant = root.tenants.get(&body.slug);
+    match tenant {
+        Some(t) if auth::secret_matches(&t.secret_hex, &body.password) => {
+            let expiry = Utc::now().timestamp() + auth::SESSION_YEARS * 365 * 24 * 3600;
+            let val = auth::sign_session(&root.key, &t.slug, expiry);
+            info!("login: {} unlocked their archive", t.slug);
+            Ok((
+                [(header::SET_COOKIE, auth::set_cookie(auth::COOKIE_NAME, &val, expiry))],
+                Json(serde_json::json!({ "ok": true, "slug": t.slug, "name": t.name })),
+            )
+                .into_response())
+        }
+        _ => {
+            // Uniform failure: never confirm the slug exists.
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "wrong password" })),
+            ))
+        }
+    }
+}
+
+async fn logout_handler() -> Response {
+    (
+        [(header::SET_COOKIE, auth::expired_cookie(auth::COOKIE_NAME))],
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+async fn whoami(Extension(t): Extension<Tenant>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "slug": t.slug, "name": t.name }))
+}
+
+static SLUG_OK: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+fn slug_re() -> &'static Regex {
+    SLUG_OK.get_or_init(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$").unwrap())
+}
+
+/// Serves a tenant's portrait pre-login (the chooser needs it). Slug is
+/// strictly validated; only fixed portrait filenames are ever looked up.
+async fn portrait_handler(
+    State(root): State<Root>,
+    Path(slug): Path<String>,
+) -> Response {
+    if !slug_re().is_match(&slug) {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    match auth::find_portrait(&root.profiles_dir, &slug)
+        .and_then(|(path, mime)| fs::read(&path).ok().map(|b| (b, mime)))
+    {
+        Some((bytes, mime)) => (
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static(mime)),
+                (header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=300")),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no portrait").into_response(),
     }
 }

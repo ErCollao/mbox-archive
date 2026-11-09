@@ -5,4 +5,5 @@ frontend/build
 data/
 archive/
 backup/
+/profiles/
 testdata/
