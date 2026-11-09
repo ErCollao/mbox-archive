@@ -208,23 +208,6 @@ fn tid_of(entries: &[MailEntry], idx: usize) -> String {
     }
 }
 
-/// Conversation-view rendering: fold quoted history into a native <details>,
-/// then sanitize for safe inline display. Scripts, event handlers and unsafe
-/// URLs are stripped; <style> is kept (shadow-DOM-scoped in the browser) so
-/// emails keep their intended look. Links get forced to new tabs.
-fn render_clean(html: &str) -> String {
-    let folded = fold_quotes(html);
-    let mut clean_content: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    clean_content.insert("script");
-    let out = ammonia::Builder::default()
-        .add_tags(&["details", "summary", "style"])
-        .add_generic_attributes(&["style"])
-        .clean_content_tags(clean_content)
-        .clean(&folded)
-        .to_string();
-    out.replace("<a href", "<a target=\"_blank\" rel=\"noreferrer noopener\" href")
-}
-
 /// Fold the quoted history of a reply into a collapsed native <details>.
 /// Gmail nests blockquotes (each reply wraps the previous whole thread), so we
 /// cut at the OUTERMOST quote marker. Both `<blockquote` and `gmail_quote` are
@@ -242,8 +225,23 @@ fn fold_quotes(html: &str) -> String {
     for pat in ["<blockquote", "class=\"gmail_quote\""] {
         let mut from = 0;
         while let Some(rel) = lower[from..].find(pat) {
-            let i = from + rel;
-            from = i + 1;
+            let raw_i = from + rel;
+            from = raw_i + 1;
+            if !html.is_char_boundary(raw_i) {
+                continue;
+            }
+            // Anchor to the enclosing tag start — but only when the match is
+            // *inside* a tag (class="..."). If the pattern already begins at
+            // '<', walking back overshoots past a closing tag and the fold
+            // gets closed early by that tag, leaving an empty <details>.
+            let i = if html.as_bytes()[raw_i] == b'<' {
+                raw_i
+            } else {
+                match html[..raw_i].rfind('<') {
+                    Some(t) => t,
+                    None => continue,
+                }
+            };
             if i <= 100 || i + 400 >= lower.len() {
                 continue;
             }
@@ -255,18 +253,36 @@ fn fold_quotes(html: &str) -> String {
         }
     }
     match cut {
-        Some(i) => format!(
-            "{}\n<details><summary>Show quoted text</summary>\n{}\n</details>",
-            &html[..i],
-            &html[i..]
-        ),
+        Some(i) => {
+            // Never cut mid-tag; the fold must start at an element boundary…
+            if !html[..i].trim_end().ends_with('>') {
+                return html.to_string();
+            }
+            // …and must not swallow an unclosed table (breaks rendering).
+            let tail_l = &lower[i..];
+            if tail_l.matches("<table").count() > tail_l.matches("</table").count() {
+                return html.to_string();
+            }
+            format!(
+                "{}\n<details><summary>Show quoted text</summary>\n{}\n</details>",
+                &html[..i],
+                &html[i..]
+            )
+        }
         None => html.to_string(),
+    }
+}
+
+fn strip_scripts(html: &str) -> String {
+    match Regex::new(r"(?is)<script[^>]*>.*?(</script>|$)|</?script[^>]*>") {
+        Ok(re) => re.replace_all(html, "").into_owned(),
+        Err(_) => html.to_string(),
     }
 }
 
 fn build_threads(entries: &[MailEntry]) -> (Vec<Thread>, Vec<usize>, HashMap<String, usize>) {
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-    for (i, e) in entries.iter().enumerate() {
+    for (i, _) in entries.iter().enumerate() {
         groups.entry(tid_of(entries, i)).or_default().push(i);
     }
     let mut threads: Vec<Thread> = Vec::with_capacity(groups.len());
@@ -1009,7 +1025,6 @@ async fn search_handler(
 async fn get_email_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
-    Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let idx: usize = match id.parse() {
         Ok(i) => i,
@@ -1037,13 +1052,13 @@ async fn get_email_content(
             // Prefer HTML if available, otherwise Text
             if let Some(html) = &body.html {
                 let html = rewrite_cid(html, &body.attachments, &id);
-                // Untrusted email HTML: isolate it from this origin
+                // Untrusted email HTML: strip scripts (the frame adds back
+                // only its own height-reporter), fold quoted history safely.
+                let html = strip_scripts(&fold_quotes(&html));
                 let mut headers = HeaderMap::new();
                 headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
                 headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-                let want_clean = q.get("clean").map(|v| v == "1").unwrap_or(false);
-                let out = if want_clean { render_clean(&html) } else { html };
-                (headers, axum::response::Html(out)).into_response()
+                (headers, axum::response::Html(html)).into_response()
             } else if let Some(text) = &body.text {
                 text.clone().into_response()
             } else {
@@ -1249,7 +1264,7 @@ async fn backup_handler(State(state): State<AppState>) -> Json<BackupOut> {
             }
             enc.try_finish().map_err(|e| format!("gzip finish failed: {}", e))?;
         }
-        let mut to_sync = fs::File::open(&tmp).map_err(|e| e.to_string())?;
+        let to_sync = fs::File::open(&tmp).map_err(|e| e.to_string())?;
         to_sync.sync_all().map_err(|e| e.to_string())?;
 
         // Verification pass: the backup is only real if it decompresses

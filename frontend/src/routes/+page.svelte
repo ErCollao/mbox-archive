@@ -27,20 +27,78 @@
     let msgData = {};
     let openMsgs = {};
     let openQuotes = {};
+    let frameH = {};
     let mailPane;
 
-    // Renders sanitized email HTML in a shadow root: email <style> stays scoped,
-    // content flows at natural height, one scrollbar for the whole conversation.
-    function shadowHtml(node, html) {
-        let root = node.attachShadow({ mode: 'open' });
-        const style = document.createElement('style');
-        style.textContent = 'img,table{max-width:100%} img{height:auto} details{margin-top:.6rem} summary{cursor:pointer;color:#06c;font-size:.8rem} pre{white-space:pre-wrap;font-family:inherit}';
-        root.appendChild(style);
-        const wrap = document.createElement('div');
-        root.appendChild(wrap);
-        wrap.innerHTML = html || '';
-        return { update(h) { wrap.innerHTML = h || ''; } };
+    // Email frames arrive with their scripts stripped; the only JS running
+    // inside is this height reporter, posted from an opaque sandbox origin.
+    function onFrameMsg(e) {
+        const d = e.data;
+        if (d && d.t === 'mbox-h' && typeof d.h === 'number') {
+            frameH = { ...frameH, [String(d.id)]: Math.min(20000, Math.max(80, d.h + 12)) };
+            // Extend the settle pin only while one is already running, so a
+            // later click inside a frame (e.g. "Show quoted text") never yanks.
+            if (Date.now() < anchorUntil) {
+                anchorUntil = Date.now() + 800;
+            }
+        }
     }
+
+    // Keep the newest message pinned to the bottom of the pane while iframe
+    // heights settle after opening a thread; release after a quiet period,
+    // and instantly if the user scrolls themselves.
+    let anchorTimer = null;
+    let anchorUntil = 0;
+    let programmatic = false;
+
+    function reanchor() {
+        anchorUntil = Date.now() + 800;
+        if (anchorTimer) return;
+        const step = () => {
+            if (mailPane) {
+                programmatic = true;
+                mailPane.scrollTop = mailPane.scrollHeight;
+                requestAnimationFrame(() => { programmatic = false; });
+            }
+            if (Date.now() < anchorUntil) {
+                anchorTimer = setTimeout(step, 90);
+            } else {
+                anchorTimer = null;
+            }
+        };
+        step();
+    }
+
+    function onPaneScroll() {
+        if (!programmatic) {
+            anchorUntil = 0;
+            if (anchorTimer) {
+                clearTimeout(anchorTimer);
+                anchorTimer = null;
+            }
+        }
+    }
+
+    function frameDoc(html, id) {
+        // Email CSS often pins html/body to height:100%, which makes
+        // scrollHeight useless; measure the body's layout box instead.
+        const reporter = '<scr' + 'ipt>(function(){' +
+            'function p(){try{var b=document.body,d=document.documentElement;' +
+            'var h=Math.max(b?b.getBoundingClientRect().height:0,b?b.offsetHeight:0,b?b.scrollHeight:0,d?d.scrollHeight:0);' +
+            'parent.postMessage({t:"mbox-h",id:' + JSON.stringify(String(id)) + ',h:Math.round(h)},"*")}catch(e){}}' +
+            'function hook(){for(var i=0;i<document.images.length;i++){var im=document.images[i];' +
+            'if(!im._hb){im._hb=1;im.addEventListener("load",p);im.addEventListener("error",p);}}}' +
+            'window.addEventListener("load",function(){hook();p();setTimeout(p,400);});' +
+            'hook();' +
+            'if(window.MutationObserver){new MutationObserver(hook).observe(document.documentElement,{childList:true,subtree:true});}' +
+            'if(window.ResizeObserver){new ResizeObserver(p).observe(document.body||document.documentElement)}' +
+            'document.addEventListener("click",function(){setTimeout(p,80);setTimeout(p,600)});' +
+            '})();</scr' + 'ipt>';
+        const base = '<base target="_blank">';
+        if (/<\/body>/i.test(html)) return html.replace(/<\/body>/i, base + reporter + '</body>');
+        return html + base + reporter;
+    }
+
     let meta = null;
     let loading = false;
     let expanded = false;
@@ -355,6 +413,12 @@
         }
     }
 
+    onMount(() => {
+        window.addEventListener('message', onFrameMsg);
+        // Cleanup only ever runs in the browser (onMount is a no-op on the server).
+        return () => window.removeEventListener('message', onFrameMsg);
+    });
+
     onMount(async () => {
         await loadFacets();
         // Default view: the actual inbox = Inbox + Personal, when present.
@@ -422,7 +486,7 @@
             msgData = { ...msgData, [id]: { loading: true, meta: null, content: "" } };
         }
         try {
-            const content = await fetch(`${API_URL}/email/${id}?clean=1`).then(r => r.text());
+            const content = await fetch(`${API_URL}/email/${id}`).then(r => r.text());
             msgData = { ...msgData, [id]: { ...msgData[id], loading: false, content } };
         } catch (e) {
             msgData = { ...msgData, [id]: { loading: false, meta: msgData[id].meta, content: "Error loading content" } };
@@ -449,18 +513,6 @@
         return { head, quote: lines.slice(first).join("\n") };
     }
 
-    function previewOf(c) {
-        if (!c) return "";
-        const text = c.trim().startsWith('<')
-            ? c.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-                 .replace(/<[^>]+>/g, ' ')
-                 .replace(/&nbsp;/g, ' ')
-                 .replace(/\s+/g, ' ')
-                 .trim()
-            : c.trim();
-        return text.slice(0, 300);
-    }
-
     async function selectThread(t) {
         selectedThread = t;
         threadMsgs = [];
@@ -477,7 +529,7 @@
             // in one paint — no staged pop-in, no late scroll.
             const pairs = await Promise.all(d.messages.map(async m => {
                 const [content, metaRes] = await Promise.all([
-                    fetch(`${API_URL}/email/${m.id}?clean=1`).then(r => r.text()),
+                    fetch(`${API_URL}/email/${m.id}`).then(r => r.text()),
                     fetch(`${API_URL}/email/${m.id}/meta`).then(r => r.ok ? r.json() : null).catch(() => null)
                 ]);
                 return [m.id, { loading: false, meta: metaRes, content }];
@@ -485,9 +537,7 @@
             msgData = Object.fromEntries(pairs);
             openMsgs = Object.fromEntries(d.messages.map(m => [m.id, true]));
             await tick();
-            if (mailPane) {
-                mailPane.scrollTop = mailPane.scrollHeight;
-            }
+            reanchor();
         } catch (e) {
             console.error(e);
         }
@@ -680,7 +730,7 @@
         </div>
     </section>
 
-    <section class="pane pane-email" bind:this={mailPane} class:has-email={selectedThread !== null}>
+    <section class="pane pane-email" bind:this={mailPane} on:scroll={onPaneScroll} class:has-email={selectedThread !== null}>
         {#if selectedThread}
             <div class="email-tools">
                 <button class="back-btn" on:click={() => { selectedThread = null; threadMsgs = []; openMsgs = {}; msgData = {}; expanded = false; }}>Back</button>
@@ -697,21 +747,18 @@
                 </div>
 
                 {#each threadMsgs as m (m.id)}
+                    {@const mlabels = msgData[m.id]?.meta?.labels || []}
                     <div class="tmsg" class:open={openMsgs[m.id]}>
-                        <button class="tmsg-head" on:click={() => toggleMsg(m)}>
-                            <div class="tmsg-row">
-                                <span class="chev">{openMsgs[m.id] ? '▾' : '▸'}</span>
-                                <span class="who">{m.from.split(' <')[0]}</span>
-                                <span class="when">{fmtDateOnly(m.date)}</span>
-                                {#if m.attachments}<span class="clip">📎</span>{/if}
-                            </div>
-                            {#if !openMsgs[m.id]}
-                                {#if msgData[m.id] && !msgData[m.id].loading}
-                                    <div class="excerpt">{previewOf(msgData[m.id].content)}</div>
-                                {:else}
-                                    <div class="excerpt dim">…</div>
-                                {/if}
+                        <button class="tmsg-row" on:click={() => toggleMsg(m)} title={m.from}>
+                            <span class="chev">{openMsgs[m.id] ? '▾' : '▸'}</span>
+                            <span class="who">{m.from.split(' <')[0]}</span>
+                            {#if mlabels.length}
+                                <span class="mini-labels">
+                                    {#each mlabels.slice(0, 4) as l (l)}<span class="mini">{dispFor(l)}</span>{/each}
+                                </span>
                             {/if}
+                            {#if m.attachments}<span class="clip">📎</span>{/if}
+                            <span class="when">{fmtDateOnly(m.date)}</span>
                         </button>
                         {#if openMsgs[m.id]}
                             <div class="tmsg-body">
@@ -719,16 +766,8 @@
                                     <div class="loading">Loading message…</div>
                                 {:else}
                                     {@const md = msgData[m.id]}
-                                    <p class="from-line"><strong>From:</strong> {m.from}</p>
                                     {#if md.meta && md.meta.to.length}
-                                        <p class="from-line"><strong>To:</strong> {md.meta.to.join(', ')}</p>
-                                    {/if}
-                                    {#if md.meta && md.meta.labels.length}
-                                        <div class="label-row header-labels">
-                                            {#each md.meta.labels as l (l)}
-                                                <span class="chip sm">{dispFor(l)}</span>
-                                            {/each}
-                                        </div>
+                                        <p class="to-line" title={md.meta.to.join(', ')}><strong>To:</strong> {md.meta.to.map(t => t.split(' <')[0]).join(', ')}</p>
                                     {/if}
                                     {#if md.meta && md.meta.attachments.some(a => !a.is_inline)}
                                         <div class="attachments">
@@ -747,7 +786,14 @@
                                         </div>
                                     {/if}
                                     {#if md.content.trim().startsWith('<')}
-                                        <div class="email-html" use:shadowHtml={md.content}></div>
+                                        <iframe
+                                            class="msg-frame"
+                                            srcdoc={frameDoc(md.content, m.id)}
+                                            title="Email content"
+                                            sandbox="allow-popups allow-scripts"
+                                            scrolling="no"
+                                            style="height: {frameH[m.id] || 320}px;"
+                                        ></iframe>
                                     {:else if splitQuoted(md.content)}
                                         {@const q = splitQuoted(md.content)}
                                         <pre>{q.head}</pre>
@@ -1177,40 +1223,53 @@
         margin: 0.2rem 0 0;
     }
     .tmsg {
-        border: 1px solid #e3e3e3;
-        border-radius: 6px;
-        margin-bottom: 0.5rem;
+        border-top: 1px solid #eee;
     }
-    .tmsg.open {
-        border-color: #c8d8f0;
+    .tmsg:last-child {
+        border-bottom: 1px solid #eee;
     }
-    .tmsg-head {
+    .tmsg-row {
         display: flex;
         align-items: center;
-        gap: 0.6rem;
+        gap: 0.5rem;
         width: 100%;
-        padding: 0.45rem 0.7rem;
-        background: #fafafa;
+        padding: 0.4rem 0.2rem;
+        background: transparent;
         border: none;
-        border-radius: 6px;
         cursor: pointer;
         font-size: 0.85rem;
         text-align: left;
     }
-    .tmsg.open .tmsg-head {
-        background: #eef4fd;
-        border-bottom: 1px solid #e3ecf8;
-        border-radius: 6px 6px 0 0;
+    .tmsg-row:hover {
+        background: #f5f7fa;
+    }
+    .tmsg.open > .tmsg-row {
+        background: #e8f0fe;
     }
     .chev {
         color: #888;
         width: 0.7rem;
+        flex-shrink: 0;
     }
     .who {
         font-weight: 600;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        max-width: 40%;
+    }
+    .mini-labels {
+        display: inline-flex;
+        gap: 0.25rem;
+        overflow: hidden;
+    }
+    .mini {
+        font-size: 0.66rem;
+        color: #666;
+        background: #eceff1;
+        border-radius: 7px;
+        padding: 0.02rem 0.4rem;
+        white-space: nowrap;
     }
     .when {
         margin-left: auto;
@@ -1219,12 +1278,21 @@
         white-space: nowrap;
     }
     .tmsg-body {
-        padding: 0.7rem 1rem;
+        padding: 0.1rem 0.2rem 0.9rem;
     }
-    .from-line {
-        margin: 0.2rem 0;
-        font-size: 0.85rem;
-        color: #333;
+    .to-line {
+        margin: 0 0 0.4rem;
+        font-size: 0.78rem;
+        color: #555;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .msg-frame {
+        width: 100%;
+        border: none;
+        background: #fff;
+        overflow: hidden;
     }
     .meta {
         font-size: 0.8rem;
@@ -1270,31 +1338,6 @@
         padding: 1rem;
         border-radius: 4px;
         font-size: 0.9rem;
-    }
-    .email-html {
-        background: #fff;
-        border: 1px solid #eee;
-        border-radius: 4px;
-        padding: 0.9rem 1.1rem;
-        font-size: 0.92rem;
-        color: #222;
-        overflow-wrap: break-word;
-    }
-    .email-html :global(img) {
-        max-width: 100%;
-        height: auto;
-    }
-    .email-html :global(table) {
-        max-width: 100%;
-    }
-    .email-html :global(details.quotes) {
-        margin-top: 0.6rem;
-    }
-    .email-html :global(details.quotes > summary) {
-        cursor: pointer;
-        color: #06c;
-        font-size: 0.8rem;
-        margin-bottom: 0.4rem;
     }
     .q-toggle {
         border: none;
