@@ -610,20 +610,7 @@ async fn main() {
     let mut tenants = HashMap::new();
     for p in profiles {
         let _ = fs::create_dir_all(data_root.join(&p.slug));
-        let epoch = auth::read_profile(&profiles_dir, &p.slug)
-            .map(|sp| auth::secret_fingerprint(&sp.secret))
-            .unwrap_or_default();
-        let t = Tenant {
-            slug: p.slug.clone(),
-            name: p.name.clone(),
-            epoch: Arc::new(RwLock::new(epoch)),
-            inner: Arc::new(RwLock::new(AppStateInner::default())),
-            data_dir: data_root.join(&p.slug),
-            archive_dir: archive_root.join(&p.slug),
-            backup_dir: backup_root.join(&p.slug),
-            busy: Arc::new(AtomicBool::new(false)),
-            backup: Arc::new(Mutex::new(BackupProgress::default())),
-        };
+        let t = seed_tenant(&profiles_dir, &p.slug, &p.name, &data_root, &archive_root, &backup_root);
         info!("tenant '{}': archive {:?}", t.name, t.archive_dir);
         // Auto-index on boot so browsing works immediately, per tenant.
         let tt = t.clone();
@@ -632,6 +619,43 @@ async fn main() {
     }
     let root = Root { tenants: Arc::new(tenants), profiles_dir, key };
 
+    let app = build_app(root);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    info!("Server running on port 3000");
+    axum::serve(listener, app).await.unwrap();
+}
+
+/// A tenant with the boot-time epoch seeded from its on-disk profile, so a
+/// restart doesn't invalidate sessions signed under the current secret.
+/// Shared by boot and integration tests.
+fn seed_tenant(
+    profiles_dir: &std::path::Path,
+    slug: &str,
+    name: &str,
+    data_root: &std::path::Path,
+    archive_root: &std::path::Path,
+    backup_root: &std::path::Path,
+) -> Tenant {
+    let epoch = auth::read_profile(profiles_dir, slug)
+        .map(|sp| auth::secret_fingerprint(&sp.secret))
+        .unwrap_or_default();
+    Tenant {
+        slug: slug.to_string(),
+        name: name.to_string(),
+        epoch: Arc::new(RwLock::new(epoch)),
+        inner: Arc::new(RwLock::new(AppStateInner::default())),
+        data_dir: data_root.join(slug),
+        archive_dir: archive_root.join(slug),
+        backup_dir: backup_root.join(slug),
+        busy: Arc::new(AtomicBool::new(false)),
+        backup: Arc::new(Mutex::new(BackupProgress::default())),
+    }
+}
+
+/// The full HTTP surface: public auth routes plus the cookie-protected
+/// archive API. Split out of main() so tests can drive it in-process.
+fn build_app(root: Root) -> Router {
     let protected = Router::new()
         .route("/api/whoami", get(whoami))
         .route("/api/profile", get(profile_info))
@@ -650,18 +674,14 @@ async fn main() {
         .route("/api/backup", post(backup_handler))
         .layer(middleware::from_fn_with_state(root.clone(), require_tenant));
 
-    let app = Router::new()
+    Router::new()
         .route("/api/profiles", get(list_profiles))
         .route("/api/login", post(login_handler))
         .route("/api/logout", post(logout_handler))
         .route("/profiles/:slug/portrait", get(portrait_handler))
         .merge(protected)
         .layer(CorsLayer::permissive())
-        .with_state(root);
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    info!("Server running on port 3000");
-    axum::serve(listener, app).await.unwrap();
+        .with_state(root)
 }
 
 async fn merge_handler(Extension(state): Extension<Tenant>) -> Json<ScanResponse> {
@@ -1656,4 +1676,247 @@ async fn profile_info(
         "name": t.name,
         "has_portrait": auth::find_portrait(&root.profiles_dir, &t.slug).is_some(),
     }))
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    struct Env {
+        base: PathBuf,
+        profiles: PathBuf,
+        data: PathBuf,
+        archive: PathBuf,
+        backup: PathBuf,
+        key: Arc<Vec<u8>>,
+    }
+
+    impl Env {
+        fn new(tag: &str) -> Env {
+            let base = std::env::temp_dir().join(format!(
+                "mbox_it_{}_{}_{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos()
+            ));
+            let env = Env {
+                profiles: base.join("profiles"),
+                data: base.join("data"),
+                archive: base.join("archive"),
+                backup: base.join("backup"),
+                base,
+                key: Arc::new((0..32u8).collect()),
+            };
+            fs::create_dir_all(&env.profiles).unwrap();
+            env
+        }
+        fn add(&self, slug: &str, name: &str, password: &str) {
+            fs::create_dir_all(self.profiles.join(slug)).unwrap();
+            auth::write_profile(&self.profiles, slug, name, &auth::sha256_hex(password)).unwrap();
+        }
+        /// Mirrors the boot path exactly: roster off disk, epoch seeded from
+        /// the stored secret. Two calls = process restart against the same disk.
+        fn root(&self) -> Root {
+            let mut tenants = HashMap::new();
+            for p in auth::load_profiles(&self.profiles) {
+                tenants.insert(
+                    p.slug.clone(),
+                    seed_tenant(&self.profiles, &p.slug, &p.name, &self.data, &self.archive, &self.backup),
+                );
+            }
+            Root {
+                tenants: Arc::new(tenants),
+                profiles_dir: self.profiles.clone(),
+                key: self.key.clone(),
+            }
+        }
+        fn app(&self) -> Router {
+            build_app(self.root())
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn req(method: &str, uri: &str, body: Body, cookie: Option<&str>, json: bool) -> Request<Body> {
+        let mut rb = Request::builder().method(method).uri(uri);
+        if json {
+            rb = rb.header(header::CONTENT_TYPE, "application/json");
+        }
+        if let Some(c) = cookie {
+            rb = rb.header(header::COOKIE, c);
+        }
+        rb.body(body).unwrap()
+    }
+
+    async fn send(app: &Router, r: Request<Body>) -> Response {
+        app.clone().oneshot(r).await.unwrap()
+    }
+
+    async fn login(app: &Router, slug: &str, password: &str) -> Response {
+        send(
+            app,
+            req(
+                "POST",
+                "/api/login",
+                Body::from(json!({ "slug": slug, "password": password }).to_string()),
+                None,
+                true,
+            ),
+        )
+        .await
+    }
+
+    fn cookie_of(r: &Response) -> String {
+        r.headers()
+            .get(header::SET_COOKIE)
+            .expect("response carries no Set-Cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn whoami_status(app: &Router, cookie: &str) -> StatusCode {
+        send(app, req("GET", "/api/whoami", Body::empty(), Some(cookie), false))
+            .await
+            .status()
+    }
+
+    async fn json_of(r: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn anonymous_and_bad_credentials_are_rejected() {
+        let env = Env::new("reject");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        assert_eq!(whoami_status(&app, "mbx_s=nope").await, StatusCode::UNAUTHORIZED);
+        assert_eq!(login(&app, "daniel", "hunter2").await.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(login(&app, "ghost", "daniel").await.status(), StatusCode::UNAUTHORIZED);
+        let body = json_of(login(&app, "daniel", "hunter2").await).await;
+        assert_eq!(body["error"], "wrong password");
+    }
+
+    #[tokio::test]
+    async fn login_upgrades_legacy_secret_and_both_sessions_work() {
+        let env = Env::new("upgrade");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        let r = login(&app, "daniel", "daniel").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = json_of(send(&app, req("GET", "/api/whoami", Body::empty(), Some(&cookie_of(&r)), false)).await).await;
+        assert_eq!(body["slug"], "daniel");
+        assert!(
+            auth::read_profile(&env.profiles, "daniel").unwrap().secret.starts_with("$2"),
+            "legacy secret should have been upgraded to bcrypt"
+        );
+        // and the bcrypt path must issue working sessions too
+        let r2 = login(&app, "daniel", "daniel").await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(whoami_status(&app, &cookie_of(&r2)).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sessions_survive_a_restart() {
+        // Regression guard for boot-time epoch seeding: a fresh Root built
+        // from the same disk must keep accepting cookies signed under the
+        // current secret.
+        let env = Env::new("restart");
+        env.add("daniel", "Daniel", "daniel");
+        let cookie = cookie_of(&login(&env.app(), "daniel", "daniel").await);
+        let rebooted = env.app();
+        assert_eq!(whoami_status(&rebooted, &cookie).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn password_change_revokes_every_older_session() {
+        let env = Env::new("revoke");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        let a = cookie_of(&login(&app, "daniel", "daniel").await);
+        let b = cookie_of(&login(&app, "daniel", "daniel").await);
+        let changed = send(
+            &app,
+            req(
+                "POST",
+                "/api/profile/password",
+                Body::from(json!({ "current": "daniel", "new": "secretive" }).to_string()),
+                Some(&a),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(changed.status(), StatusCode::OK);
+        let a2 = cookie_of(&changed);
+        assert_eq!(whoami_status(&app, &a2).await, StatusCode::OK, "changed device keeps working");
+        assert_eq!(whoami_status(&app, &a).await, StatusCode::UNAUTHORIZED, "old cookie revoked");
+        assert_eq!(whoami_status(&app, &b).await, StatusCode::UNAUTHORIZED, "other device revoked");
+        assert_eq!(login(&app, "daniel", "daniel").await.status(), StatusCode::UNAUTHORIZED, "old password dead");
+        let fresh = login(&app, "daniel", "secretive").await;
+        assert_eq!(fresh.status(), StatusCode::OK, "new password logs in");
+        assert_eq!(whoami_status(&app, &cookie_of(&fresh)).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn too_short_new_password_is_400_and_changes_nothing() {
+        let env = Env::new("shortpw");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        let a = cookie_of(&login(&app, "daniel", "daniel").await);
+        let before = auth::read_profile(&env.profiles, "daniel").unwrap().secret;
+        let r = send(
+            &app,
+            req(
+                "POST",
+                "/api/profile/password",
+                Body::from(json!({ "current": "daniel", "new": "abc" }).to_string()),
+                Some(&a),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(auth::read_profile(&env.profiles, "daniel").unwrap().secret, before);
+        assert_eq!(whoami_status(&app, &a).await, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tampered_cookie_is_rejected() {
+        let env = Env::new("tamper");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+        let (_, val) = cookie.split_once('=').unwrap();
+        let (ph, sig) = val.split_once('.').unwrap();
+        let mut chars: Vec<char> = ph.chars().collect();
+        chars[0] = if chars[0] == '0' { '1' } else { '0' };
+        let bad = format!("mbx_s={}.{}", chars.iter().collect::<String>(), sig);
+        assert_eq!(whoami_status(&app, &bad).await, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_expires_the_session_cookie() {
+        let env = Env::new("logout");
+        env.add("daniel", "Daniel", "daniel");
+        let app = env.app();
+        let r = send(&app, req("POST", "/api/logout", Body::empty(), None, false)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let sc = r.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+        assert!(sc.contains("Max-Age=0"));
+    }
 }
