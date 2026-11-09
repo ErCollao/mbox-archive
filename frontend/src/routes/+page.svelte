@@ -891,7 +891,7 @@
         display: flex;
         flex-direction: column;
         gap: 0.45rem;
-        padding: 0.6rem 1rem;
+        padding: 1rem 1rem 0.6rem;
         font-size: 0.8rem;
         color: #444;
         border-bottom: 1px solid #ddd;
@@ -1204,7 +1204,7 @@
         display: flex;
         align-items: center;
         gap: 0.7rem;
-        padding: 0.55rem 2rem;
+        padding: 1rem 2rem 0.55rem;
         margin: 0 -2rem 0.6rem;
         border-bottom: 1px solid #eee;
     }
