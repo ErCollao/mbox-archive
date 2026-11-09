@@ -208,8 +208,14 @@ fn tid_of(entries: &[MailEntry], idx: usize) -> String {
     }
 }
 
+/// Base font for email documents: most emails never declare a global font and
+/// would otherwise render in browser-default serif. Setting it on html/body
+/// only changes the inheritable default — elements with their own font-family
+/// (designed newsletters etc.) are untouched.
+const BASE_STYLE: &str = "<style>html,body{font-family:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;}</style>";
+
 const FOLD_STYLE: &str = r#"<style>
-details.quotes{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;}
+details.quotes{font-family:ui-sans-serif,-apple-system,'Segoe UI',Roboto,sans-serif;font-size:13px;}
 details.quotes>summary{color:#8a8a8a;cursor:pointer;padding:0.75rem 0 0.35rem;outline:none;list-style:none;}
 details.quotes>summary::-webkit-details-marker{display:none;}
 details.quotes[open]>summary{padding-top:0.9rem;color:#666;}
@@ -1069,6 +1075,7 @@ async fn get_email_content(
                 } else {
                     html
                 };
+                let html = format!("{BASE_STYLE}{html}");
                 let mut headers = HeaderMap::new();
                 headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
                 headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));

@@ -379,6 +379,10 @@
         const names = labels.map(([n]) => n);
         if (names.includes("Category Personal")) sel = { ...sel, cat: "Category Personal" };
         loadInbox();
+        // Deep link: /?t=<thread>&m=<message>
+        const p = new URLSearchParams(window.location.search);
+        const tid = p.get("t");
+        if (tid) openThread(tid, p.get("m"));
     });
 
     // ---------- threads: one message at a time (B) ----------
@@ -387,6 +391,7 @@
         activeMsgId = id;
         active = { loading: true, meta: null, content: "" };
         openQuotes = { ...openQuotes, [id]: false };
+        setUrl(selectedThread ? selectedThread.tid : null, id);
         if (mailPane) mailPane.scrollTop = 0;
         try {
             const [content, metaRes] = await Promise.all([
@@ -400,18 +405,29 @@
         }
     }
 
-    async function selectThread(t) {
-        selectedThread = t;
+    // Deep-linking: keep the URL in sync with the opened thread/message
+    // (replaceState: shareable/bookmarkable, without polluting history).
+    function setUrl(tid, mid) {
+        const u = new URL(window.location.href);
+        if (tid) u.searchParams.set("t", tid); else u.searchParams.delete("t");
+        if (mid) u.searchParams.set("m", mid); else u.searchParams.delete("m");
+        history.replaceState(history.state, "", u);
+    }
+
+    async function openThread(tid, mid) {
+        selectedThread = { tid, subject: "" };
         threadMsgs = [];
         activeMsgId = null;
         active = { loading: true, meta: null, content: "" };
         try {
-            const res = await fetch(`${API_URL}/thread?tid=${encodeURIComponent(t.tid)}`);
+            const res = await fetch(`${API_URL}/thread?tid=${encodeURIComponent(tid)}`);
             const d = await res.json();
+            selectedThread = { tid: d.tid, subject: d.subject };
             threadMsgs = d.messages;
-            if (d.messages.length) {
-                await loadMessage(d.messages[d.messages.length - 1].id);
-            }
+            const target = mid && d.messages.some(m => m.id === mid)
+                ? mid
+                : (d.messages.length ? d.messages[d.messages.length - 1].id : null);
+            if (target) await loadMessage(target);
         } catch (e) {
             console.error(e);
         }
@@ -431,6 +447,7 @@
         threadMsgs = [];
         activeMsgId = null;
         expanded = false;
+        setUrl(null, null);
     }
 
     // Quote folding for plain-text messages (HTML folds happen server-side).
@@ -616,7 +633,7 @@
                     <div
                         class="email-item"
                         class:selected={selectedThread && selectedThread.tid === t.tid}
-                        on:click={() => selectThread(t)}
+                        on:click={() => openThread(t.tid)}
                     >
                         <div class="subject" title={t.subject}>{#if t.attachments}<span class="clip" title="Has attachments">📎</span>{/if}{t.subject || '(No Subject)'}{#if t.count > 1}<span class="badge">{mode === 'search' && t.matched ? `${t.matched}/${t.count}` : t.count}</span>{/if}</div>
                         <div class="meta">
