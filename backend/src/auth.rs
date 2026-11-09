@@ -65,13 +65,16 @@ pub fn sha256_hex(text: &str) -> String {
 }
 
 /// Fixed-order comparison so the check doesn't short-circuit on the first byte.
+/// The expected hash is lowercased: disk input is not trusted to keep our
+/// convention (the boot loader does, ad-hoc file edits may not).
 pub fn secret_matches(expected_hex: &str, password: &str) -> bool {
+    let expected = expected_hex.to_lowercase();
     let got = sha256_hex(password);
-    if got.len() != expected_hex.len() {
+    if got.len() != expected.len() {
         return false;
     }
     let mut diff = 0u8;
-    for (a, b) in got.bytes().zip(expected_hex.bytes()) {
+    for (a, b) in got.bytes().zip(expected.bytes()) {
         diff |= a ^ b;
     }
     diff == 0
@@ -105,17 +108,23 @@ pub fn session_key(path: &std::path::Path) -> Vec<u8> {
     key
 }
 
-/// Cookie value: hex("slug:expiry_epoch") + "." + hex(HMAC-SHA256).
-pub fn sign_session(key: &[u8], slug: &str, expiry_epoch: i64) -> String {
-    let payload = format!("{}:{}", slug, expiry_epoch);
+/// Short fingerprint of a stored secret. Cookies carry it so that changing
+/// (or upgrading) the password instantly invalidates every older session.
+pub fn secret_fingerprint(secret: &str) -> String {
+    hex::encode(<Sha256 as Digest>::digest(secret))[..16].to_string()
+}
+
+/// Cookie value: hex("slug:expiry_epoch:fingerprint") + "." + hex(HMAC-SHA256).
+pub fn sign_session(key: &[u8], slug: &str, expiry_epoch: i64, fingerprint: &str) -> String {
+    let payload = format!("{}:{}:{}", slug, expiry_epoch, fingerprint);
     let mut mac =
         Hmac::<Sha256>::new_from_slice(key).expect("hmac accepts any key length");
     mac.update(payload.as_bytes());
     format!("{}.{}", hex::encode(payload), hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Returns (slug, expiry_epoch) if the signature and expiry check out.
-pub fn verify_session(key: &[u8], value: &str, now_epoch: i64) -> Option<(String, i64)> {
+/// Returns (slug, expiry_epoch, fingerprint) if the signature and expiry check out.
+pub fn verify_session(key: &[u8], value: &str, now_epoch: i64) -> Option<(String, i64, String)> {
     let (payload_hex, sig_hex) = value.split_once('.')?;
     let payload = hex::decode(payload_hex).ok()?;
     let mut expect = Hmac::<Sha256>::new_from_slice(key).ok()?;
@@ -124,12 +133,13 @@ pub fn verify_session(key: &[u8], value: &str, now_epoch: i64) -> Option<(String
         .verify_slice(&hex::decode(sig_hex).ok()?)
         .ok()?;
     let text = String::from_utf8(payload).ok()?;
-    let (slug, exp) = text.rsplit_once(':')?;
+    let (slug, rest) = text.split_once(':')?;
+    let (exp, fp) = rest.rsplit_once(':')?;
     let exp = exp.parse::<i64>().ok()?;
     if exp <= now_epoch || slug.is_empty() {
         return None;
     }
-    Some((slug.to_string(), exp))
+    Some((slug.to_string(), exp, fp.to_string()))
 }
 
 fn max_age_remaining(expiry_epoch: i64) -> i64 {
@@ -238,5 +248,194 @@ pub fn save_portrait(dir: &std::path::Path, slug: &str, bytes: &[u8], ext: &str)
 pub fn delete_portrait(dir: &std::path::Path, slug: &str) {
     for file in ["portrait.jpg", "portrait.jpeg", "portrait.png", "portrait.webp"] {
         let _ = fs::remove_file(dir.join(slug).join(file));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn key() -> Vec<u8> {
+        (0..32u8).collect()
+    }
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "mboxauth_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn sign_verify_roundtrip() {
+        let k = key();
+        let exp = now() + 3600;
+        let c = sign_session(&k, "daniel", exp, "deadbeef");
+        assert_eq!(verify_session(&k, &c, now()), Some(("daniel".to_string(), exp, "deadbeef".to_string())));
+    }
+
+    #[test]
+    fn slug_with_weird_chars_survives() {
+        // slugs are folder names; ':' is the field separator, everything else must survive
+        let k = key();
+        let exp = now() + 3600;
+        let c = sign_session(&k, "a-h_1", exp, "ff00");
+        let (slug, _, fp) = verify_session(&k, &c, now()).unwrap();
+        assert_eq!((slug.as_str(), fp.as_str()), ("a-h_1", "ff00"));
+    }
+
+    #[test]
+    fn tampered_payload_rejected() {
+        let k = key();
+        let c = sign_session(&k, "daniel", now() + 3600, "aa");
+        // swap a hex char of the payload part
+        let (ph, sig) = c.split_once('.').unwrap();
+        let mut b: Vec<char> = ph.chars().collect();
+        b[0] = if b[0] == '0' { '1' } else { '0' };
+        let c2 = format!("{}.{}", b.iter().collect::<String>(), sig);
+        assert_eq!(verify_session(&k, &c2, now()), None);
+    }
+
+    #[test]
+    fn tampered_signature_rejected() {
+        let k = key();
+        let c = sign_session(&k, "daniel", now() + 3600, "aa");
+        let (ph, sig) = c.split_once('.').unwrap();
+        let mut b: Vec<char> = sig.chars().collect();
+        b[5] = if b[5] == 'f' { 'e' } else { 'f' };
+        let c2 = format!("{}.{}", ph, b.iter().collect::<String>());
+        assert_eq!(verify_session(&k, &c2, now()), None);
+    }
+
+    #[test]
+    fn wrong_key_rejected() {
+        let c = sign_session(&key(), "daniel", now() + 3600, "aa");
+        let mut other = key();
+        other[0] ^= 1;
+        assert_eq!(verify_session(&other, &c, now()), None);
+    }
+
+    #[test]
+    fn expired_rejected() {
+        let k = key();
+        let c = sign_session(&k, "daniel", now() - 10, "aa");
+        assert_eq!(verify_session(&k, &c, now()), None);
+    }
+
+    #[test]
+    fn garbage_inputs_rejected() {
+        let k = key();
+        for bad in ["", "x", "a.b", "..", "zz.zz", "61.b", "61.", ".61", &format!("{}.{}", "zz", "zz")] {
+            assert_eq!(verify_session(&k, bad, now()), None, "accepted: {:?}", bad);
+        }
+    }
+
+    #[test]
+    fn extract_cookie_variants() {
+        assert_eq!(extract_cookie("mbx_s=abc", "mbx_s").as_deref(), Some("abc"));
+        assert_eq!(extract_cookie("other=1; mbx_s=abc ; x=2", "mbx_s").as_deref(), Some("abc"));
+        assert_eq!(extract_cookie("other=1; x=2", "mbx_s"), None);
+    }
+
+    #[test]
+    fn legacy_secret_matching() {
+        let h = sha256_hex("daniel");
+        assert!(h.len() == 64);
+        assert!(secret_matches(&h, "daniel"));
+        assert!(!secret_matches(&h, "Daniel"));
+        assert!(secret_matches(&h.to_uppercase(), "daniel")); // hex is case-insensitive
+    }
+
+    #[test]
+    fn is_legacy_detection() {
+        assert!(is_legacy("bd3dae5fb91f88a4f0978222dfd58f59a124257cb081486387cbae9df11fb879"));
+        assert!(!is_legacy("$2b$10$abcdefghijklmnopqrstuv"));
+    }
+
+    #[test]
+    fn bcrypt_verify_path() {
+        // cost 4 keeps the test suite quick; verify_secret is cost-agnostic
+        let h = bcrypt::hash("s3cret", 4).unwrap();
+        assert!(!is_legacy(&h));
+        assert!(verify_secret(&h, "s3cret"));
+        assert!(!verify_secret(&h, "s3cr3t"));
+    }
+
+    #[test]
+    fn fingerprint_stable_and_distinct() {
+        let a = secret_fingerprint("one");
+        assert_eq!(a, secret_fingerprint("one"));
+        assert_ne!(a, secret_fingerprint("two"));
+        assert_eq!(a.len(), 16);
+    }
+
+    #[test]
+    fn profile_write_read_roundtrip() {
+        let d = tmpdir("prof");
+        fs::create_dir_all(d.join("hajni")).unwrap();
+        write_profile(&d, "hajni", "Hajni", "hash123").unwrap();
+        let sp = read_profile(&d, "hajni").unwrap();
+        assert_eq!(sp.name, "Hajni");
+        assert_eq!(sp.secret, "hash123");
+        assert!(!d.join("hajni").join("profile.json.tmp").exists());
+        assert!(read_profile(&d, "ghost").is_none());
+        // unicode names survive the round-trip
+        write_profile(&d, "hajni", "Hajni Хайникова", "x").unwrap();
+        assert_eq!(read_profile(&d, "hajni").unwrap().name, "Hajni Хайникова");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn portrait_lifecycle() {
+        let d = tmpdir("port");
+        fs::create_dir_all(d.join("daniel")).unwrap();
+        assert!(find_portrait(&d, "daniel").is_none());
+        save_portrait(&d, "daniel", b"\xff\xd8\xff\xfffake", "jpg").unwrap();
+        let (p, mime) = find_portrait(&d, "daniel").unwrap();
+        assert_eq!(mime, "image/jpeg");
+        // extension switch must not leave a stale sibling behind
+        save_portrait(&d, "daniel", b"\x89PNG fake", "png").unwrap();
+        assert!(!d.join("daniel").join("portrait.jpg").exists());
+        assert!(d.join("daniel").join("portrait.png").exists());
+        delete_portrait(&d, "daniel");
+        assert!(find_portrait(&d, "daniel").is_none());
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn cookie_format_basics() {
+        let exp = now() + 3600;
+        let s = set_cookie("mbx_s", "payload.sig", exp);
+        assert!(s.starts_with("mbx_s=payload.sig; Path=/; HttpOnly; SameSite=Lax"));
+        assert!(s.contains("Max-Age="));
+        assert!(s.contains("GMT"));
+        assert!(expired_cookie("mbx_s").contains("Max-Age=0"));
+    }
+
+    #[test]
+    fn session_key_roundtrip() {
+        let d = tmpdir("key");
+        let p: &Path = &d.join("session.key");
+        let k1 = session_key(p);
+        assert_eq!(k1.len(), 32);
+        let k2 = session_key(p);
+        assert_eq!(k1, k2, "key must persist across calls");
+        // corrupt file regenerates rather than crashing
+        fs::write(p, "not-hex").unwrap();
+        assert_eq!(session_key(p).len(), 32);
+        fs::remove_dir_all(&d).ok();
     }
 }

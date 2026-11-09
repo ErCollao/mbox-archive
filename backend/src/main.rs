@@ -39,6 +39,9 @@ use tracing::{info, error, warn};
 struct Tenant {
     slug: String,
     name: String,
+    /// fingerprint of the current secret; sessions carry it, so a password
+    /// change revokes all older cookies. Reread at boot, updated live on change.
+    epoch: Arc<RwLock<String>>,
     inner: Arc<RwLock<AppStateInner>>,
     data_dir: PathBuf,
     archive_dir: PathBuf,
@@ -607,9 +610,13 @@ async fn main() {
     let mut tenants = HashMap::new();
     for p in profiles {
         let _ = fs::create_dir_all(data_root.join(&p.slug));
+        let epoch = auth::read_profile(&profiles_dir, &p.slug)
+            .map(|sp| auth::secret_fingerprint(&sp.secret))
+            .unwrap_or_default();
         let t = Tenant {
             slug: p.slug.clone(),
             name: p.name.clone(),
+            epoch: Arc::new(RwLock::new(epoch)),
             inner: Arc::new(RwLock::new(AppStateInner::default())),
             data_dir: data_root.join(&p.slug),
             archive_dir: archive_root.join(&p.slug),
@@ -1393,7 +1400,13 @@ async fn require_tenant(
     let tenant = cookie
         .as_deref()
         .and_then(|c| auth::verify_session(&root.key, c, Utc::now().timestamp()))
-        .and_then(|(slug, _)| root.tenants.get(&slug).cloned());
+        .and_then(|(slug, _exp, fp)| {
+            // A cookie outlives the secret it was issued under only by accident:
+            // after a password change the fingerprint mismatches and it dies.
+            root.tenants.get(&slug).cloned().filter(|t| {
+                t.epoch.read().map(|e| *e == fp).unwrap_or(false)
+            })
+        });
     match tenant {
         Some(t) => {
             req.extensions_mut().insert(t);
@@ -1453,19 +1466,29 @@ async fn login_handler(
     }
     // Transparent migration: saltless sha256 -> bcrypt, using the plaintext
     // we already have verified. Worst case it logs and keeps the old hash.
-    if auth::is_legacy(&stored.secret) {
-        match auth::write_profile(
-            &root.profiles_dir,
-            &body.slug,
-            &stored.name,
-            &auth::hash_password(&body.password),
-        ) {
-            Ok(()) => info!("upgraded '{}' secret to bcrypt", body.slug),
-            Err(e) => warn!("secret upgrade failed for {}: {}", body.slug, e),
+    let final_secret = if auth::is_legacy(&stored.secret) {
+        let upgraded = auth::hash_password(&body.password);
+        match auth::write_profile(&root.profiles_dir, &body.slug, &stored.name, &upgraded) {
+            Ok(()) => {
+                info!("upgraded '{}' secret to bcrypt", body.slug);
+                upgraded
+            }
+            Err(e) => {
+                warn!("secret upgrade failed for {}: {}", body.slug, e);
+                stored.secret.clone()
+            }
+        }
+    } else {
+        stored.secret.clone()
+    };
+    let fp = auth::secret_fingerprint(&final_secret);
+    if let Some(t) = root.tenants.get(&body.slug) {
+        if let Ok(mut e) = t.epoch.write() {
+            *e = fp.clone();
         }
     }
     let expiry = Utc::now().timestamp() + auth::SESSION_YEARS * 365 * 24 * 3600;
-    let val = auth::sign_session(&root.key, &body.slug, expiry);
+    let val = auth::sign_session(&root.key, &body.slug, expiry, &fp);
     info!("login: {} unlocked their archive", body.slug);
     Ok((
         [(header::SET_COOKIE, auth::set_cookie(auth::COOKIE_NAME, &val, expiry))],
@@ -1552,15 +1575,23 @@ async fn change_password(
             Json(serde_json::json!({ "error": "current password is wrong" })),
         ));
     }
-    auth::write_profile(
-        &root.profiles_dir,
-        &t.slug,
-        &stored.name,
-        &auth::hash_password(&b.new),
+    let new_hash = auth::hash_password(&b.new);
+    auth::write_profile(&root.profiles_dir, &t.slug, &stored.name, &new_hash)
+        .map_err(|e| server_err(format!("could not save: {}", e)))?;
+    // Revokes every session signed under the old secret...
+    let fp = auth::secret_fingerprint(&new_hash);
+    if let Ok(mut e) = t.epoch.write() {
+        *e = fp.clone();
+    }
+    // ...except this device, which silently gets a fresh cookie.
+    let expiry = Utc::now().timestamp() + auth::SESSION_YEARS * 365 * 24 * 3600;
+    let val = auth::sign_session(&root.key, &t.slug, expiry, &fp);
+    info!("password changed for '{}' (older sessions revoked)", t.slug);
+    Ok((
+        [(header::SET_COOKIE, auth::set_cookie(auth::COOKIE_NAME, &val, expiry))],
+        Json(serde_json::json!({ "ok": true })),
     )
-    .map_err(|e| server_err(format!("could not save: {}", e)))?;
-    info!("password changed for '{}'", t.slug);
-    Ok(Json(serde_json::json!({ "ok": true })).into_response())
+        .into_response())
 }
 
 #[derive(Deserialize)]
