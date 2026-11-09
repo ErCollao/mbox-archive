@@ -825,7 +825,7 @@ async fn scan_handler(Extension(state): Extension<Tenant>) -> Json<ScanResponse>
                  }
             }
             if candidates.is_empty() {
-                error!("No mbox files found to scan");
+                info!("nothing to index for '{}' yet — drop .mbox files into {:?}", state.slug, data_dir);
                 return;
             }
             if candidates.len() > 1 {
