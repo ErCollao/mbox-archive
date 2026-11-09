@@ -16,17 +16,24 @@ backup/<slug>/                 gzip backups from the maintenance page
 The app refuses to start with zero valid profiles (fail-closed), and a broken
 `profile.json` only skips that one profile — it never takes others down.
 
-## Passwords
+## Passwords & photos
 
-`secret` is the lowercase hex sha256 of the password, nothing more:
+In-app: the avatar chip (top-left) opens `/profile` — change the password there,
+upload a portrait (JPEG/PNG/WebP, ≤12 MB; it shows up on the sign-in chooser).
+Changes are written straight to `profiles/<slug>/profile.json` and take effect
+immediately, no restart.
+
+Secrets are bcrypt hashes. Legacy sha256 entries are upgraded to bcrypt
+automatically on next successful login.
+
+To bootstrap a brand-new profile from the shell, seed it with a sha256 hex:
 
 ```sh
 printf '%s' 'the password' | shasum -a 256 | cut -d' ' -f1
 ```
 
-Edit `profiles/<slug>/profile.json` and restart the backend to apply.
-
-Demo profiles from the initial migration: passwords are `daniel` and `hajni` — change them.
+...then the first login turns it into bcrypt. Demo profiles from the initial
+migration: passwords are `daniel` and `hajni` — change them via `/profile`.
 
 ## Adding / removing a person
 

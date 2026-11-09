@@ -375,11 +375,6 @@
 
     let me = null; // { slug, name } once authenticated
 
-    async function lockNow() {
-        await fetch('/api/logout', { method: 'POST' });
-        window.location.href = '/welcome';
-    }
-
     onMount(async () => {
         const res = await fetch('/api/whoami');
         if (res.status === 401) {
@@ -495,10 +490,10 @@
         <div class="title-row">
             <div class="title-left">
                 {#if me}
-                    <button class="who" title="{me.name} — click to lock / switch profile" on:click={lockNow}>
+                    <a class="who" href="/profile" title="{me.name} — profile & password">
                         <img src="/profiles/{me.slug}/portrait" alt="" on:error={(e) => e.currentTarget.remove()} />
                         <span>{me.name.charAt(0)}</span>
-                    </button>
+                    </a>
                 {/if}
                 <h1>Mbox Archive</h1>
             </div>
@@ -861,6 +856,7 @@
         flex-shrink: 0;
     }
     .who:hover { box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.3); }
+    .who { text-decoration: none; }
     .who img {
         position: absolute;
         inset: 0;
