@@ -1486,10 +1486,6 @@
             height: calc(100vh - 260px);
             min-height: 300px;
         }
-        .body iframe {
-            height: calc(100vh - 230px);
-            min-height: 300px;
-        }
     }
     .burger {
         display: none;
