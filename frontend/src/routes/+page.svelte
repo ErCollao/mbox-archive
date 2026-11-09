@@ -373,7 +373,20 @@
         }
     }
 
+    let me = null; // { slug, name } once authenticated
+
+    async function lockNow() {
+        await fetch('/api/logout', { method: 'POST' });
+        window.location.href = '/welcome';
+    }
+
     onMount(async () => {
+        const res = await fetch('/api/whoami');
+        if (res.status === 401) {
+            window.location.href = '/welcome';
+            return;
+        }
+        me = await res.json();
         await loadFacets();
         // Default view: the main category, when present.
         const names = labels.map(([n]) => n);
@@ -480,7 +493,15 @@
 <div class="container" class:email-expanded={expanded} class:drawer-open={drawerOpen}>
     <aside class="pane pane-settings">
         <div class="title-row">
-            <h1>Mbox Archive</h1>
+            <div class="title-left">
+                {#if me}
+                    <button class="who" title="{me.name} — click to lock / switch profile" on:click={lockNow}>
+                        <img src="/profiles/{me.slug}/portrait" alt="" on:error={(e) => e.currentTarget.remove()} />
+                        <span>{me.name.charAt(0)}</span>
+                    </button>
+                {/if}
+                <h1>Mbox Archive</h1>
+            </div>
             <a class="gear" href="/maintenance" title="Maintenance & backup">⚙</a>
         </div>
 
@@ -815,6 +836,37 @@
     .title-row h1 {
         margin: 0;
         font-size: 1.05rem;
+    }
+    .title-left {
+        display: flex;
+        align-items: center;
+        gap: 0.55rem;
+    }
+    .who {
+        position: relative;
+        width: 27px;
+        height: 27px;
+        border-radius: 50%;
+        border: none;
+        padding: 0;
+        cursor: pointer;
+        background: #1a73e8;
+        color: white;
+        font-size: 0.8rem;
+        font-weight: 600;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        flex-shrink: 0;
+    }
+    .who:hover { box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.3); }
+    .who img {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
     }
     .gear {
         text-decoration: none;

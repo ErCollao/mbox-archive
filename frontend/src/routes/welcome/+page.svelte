@@ -1,54 +1,46 @@
 <script>
-    // PROTOTYPE — profile gate. Matches the app's own visual language;
-    // the entrance should feel like part of the thing it guards.
-    //
-    // Photos: client-probes static/profiles/<slug>.jpg after mount
-    // (SSR cannot know if the file exists; error events pre-hydration
-    // are lost), falling back to the placeholder until one is dropped in.
+    // Profile gate: real roster from /api/profiles, real login via /api/login.
+    // Stage lives in the URL (?p=<slug>) so browser back/forward work.
 
     import { onMount } from 'svelte';
     import { page } from '$app/stores';
-    import { goto } from '$app/navigation';
 
-    const PROFILES = [
-        { slug: "daniel", name: "Daniel", color: "#1a73e8", demo: "daniel" },
-        { slug: "hajni", name: "Hajni", color: "#0b8043", demo: "hajni" }
-    ];
+    const TINTS = ["#1a73e8", "#0b8043", "#d93025", "#8430ce", "#e37400", "#12a4af"];
 
-    // Stage lives in the URL (?p=<slug>), so browser back/forward just work.
+    let profiles = [];
+
     $: slug = $page.url.searchParams.get("p");
-    $: chosen = PROFILES.find(p => p.slug === slug) || null;
-    $: stage = chosen ? "secret" : "choose";
+    $: chosen = profiles.find(p => p.slug === slug) || null;
 
     let pw = "";
     let showPw = false;
     let shake = false;
-    let photoOk = {};
     $: (slug, pw = "", showPw = false, shake = false);
 
-    onMount(() => {
-        PROFILES.forEach(p => {
-            const probe = new Image();
-            probe.onload = () => { photoOk = { ...photoOk, [p.slug]: true }; };
-            probe.src = `/profiles/${p.slug}.jpg`;
-        });
+    onMount(async () => {
+        try {
+            const res = await fetch('/api/profiles');
+            profiles = await res.json();
+        } catch { /* roster unreachable: chooser stays empty */ }
     });
 
-    function pic(p) {
-        return photoOk[p.slug] ? `/profiles/${p.slug}.jpg` : `/profiles/${p.slug}.svg`;
-    }
-
-    function pick(p) { goto(`?p=${p.slug}`); }
-    function back() { history.back(); }
+    function tint(i) { return TINTS[i % TINTS.length]; }
 
     function submit() {
-        if (pw === chosen.demo) {
-            // Prototype stand-in for the session cookie: enter the real app.
-            window.location.href = "/";
-        } else {
-            shake = true;
-            setTimeout(() => { shake = false; pw = ""; }, 450);
-        }
+        const body = JSON.stringify({ slug: chosen.slug, password: pw });
+        fetch('/api/login', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body
+        })
+            .then(r => {
+                if (r.ok) window.location.href = "/";
+                else throw new Error("bad");
+            })
+            .catch(() => {
+                shake = true;
+                setTimeout(() => { shake = false; pw = ""; }, 450);
+            });
     }
 </script>
 
@@ -57,39 +49,47 @@
 </svelte:head>
 
 <div class="screen">
-    {#if stage === "choose"}
+    {#if !chosen}
         <div class="panel">
             <div class="brand"><span class="brand-dot"></span> Mbox Archive</div>
             <h1>Who's browsing?</h1>
             <p class="sub">Each profile sees only its own archive.</p>
             <div class="cards">
-                {#each PROFILES as p (p.slug)}
-                    <button class="card" on:click={() => pick(p)}>
-                        <span class="picwrap" style="--tint:{p.color}">
-                            <img src={pic(p)} alt={p.name} />
+                {#each profiles as p, i (p.slug)}
+                    <a class="card" href="?p={p.slug}">
+                        <span class="picwrap" style="--tint:{tint(i)}">
+                            {#if p.has_portrait}
+                                <img src="/profiles/{p.slug}/portrait" alt={p.name} />
+                            {:else}
+                                <span class="mono">{p.name.charAt(0)}</span>
+                            {/if}
                         </span>
                         <span class="pname">{p.name}</span>
-                    </button>
+                    </a>
                 {/each}
             </div>
         </div>
-    {:else if stage === "secret"}
+    {:else}
         <div class="panel {shake ? 'shake' : ''}">
-            <button class="backchip" title="Back" on:click={back}>
+            <button class="backchip" title="Back" on:click={() => history.back()}>
                 <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
                     <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
                 </svg>
             </button>
-            <span class="picwrap big" style="--tint:{chosen.color}">
-                <img src={pic(chosen)} alt={chosen.name} />
+            <span class="picwrap big" style="--tint:{tint(profiles.indexOf(chosen))}">
+                {#if chosen.has_portrait}
+                    <img src="/profiles/{chosen.slug}/portrait" alt={chosen.name} />
+                {:else}
+                    <span class="mono">{chosen.name.charAt(0)}</span>
+                {/if}
             </span>
             <h1>{chosen.name}</h1>
-            <p class="sub">Password <span class="dim">(demo: {chosen.demo})</span></p>
+            <p class="sub">Password</p>
             <form class="pwgroup" on:submit|preventDefault={submit}>
                 {#if showPw}
-                    <input type="text" bind:value={pw} placeholder="password" autocomplete="off" autofocus />
+                    <input type="text" bind:value={pw} placeholder="password" autocomplete="current-password" autofocus />
                 {:else}
-                    <input type="password" bind:value={pw} placeholder="password" autocomplete="off" autofocus />
+                    <input type="password" bind:value={pw} placeholder="password" autocomplete="current-password" autofocus />
                 {/if}
                 <button type="button" class="seg" title={showPw ? 'Hide password' : 'Show password'} on:click={() => showPw = !showPw}>
                     {#if showPw}
@@ -132,7 +132,6 @@
         justify-content: center;
     }
 
-    /* one card language everywhere — same bones as the app's label-groups */
     .panel {
         position: relative;
         background: #fff;
@@ -161,7 +160,6 @@
     .brand-dot { width: 8px; height: 8px; border-radius: 2px; background: #1a73e8; }
     h1 { font-size: 1.25rem; margin: 0 0 .25rem; font-weight: 600; }
     .sub { color: #666; margin: 0 0 1.4rem; font-size: .85rem; }
-    .dim { color: #aaa; }
 
     .cards { display: flex; gap: 1.1rem; justify-content: center; flex-wrap: wrap; }
     .card {
@@ -177,7 +175,7 @@
         gap: .65rem;
         transition: background .12s ease, border-color .12s ease;
         color: #202124;
-        font-family: inherit;
+        text-decoration: none;
     }
     .card:hover { background: #f5f7fa; border-color: #e0e0e0; }
     .picwrap {
@@ -185,17 +183,40 @@
         height: 104px;
         border-radius: 50%;
         overflow: hidden;
-        display: block;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         background: var(--tint, #ccc);
         border: 2px solid #fff;
         box-shadow: 0 0 0 1px #e0e0e0, 0 3px 10px rgba(0, 0, 0, 0.10);
     }
     .picwrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .picwrap.big { width: 88px; height: 88px; margin-bottom: .9rem; }
+    .mono { color: white; font-size: 2.4rem; font-weight: 600; }
+    .picwrap.big .mono { font-size: 2rem; }
     .pname { font-weight: 600; font-size: .95rem; }
 
     .shake { animation: shake .4s; }
     @keyframes shake { 0%, 100% { transform: none } 25% { transform: translateX(-6px) } 75% { transform: translateX(6px) } }
+
+    .backchip {
+        position: absolute;
+        top: 1.1rem;
+        left: 1.1rem;
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 1px solid #e0e0e0;
+        background: #fff;
+        color: #80868b;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        transition: border-color .12s ease, color .12s ease;
+    }
+    .backchip:hover { border-color: #1a73e8; color: #1a73e8; }
 
     .pwgroup {
         display: flex;
@@ -232,22 +253,4 @@
     .seg:hover { background: #f1f3f4; color: #202124; }
     .go-seg { color: #1a73e8; }
     .go-seg:disabled { color: #c0c4c9; cursor: default; background: transparent; }
-    .backchip {
-        position: absolute;
-        top: 1.1rem;
-        left: 1.1rem;
-        width: 34px;
-        height: 34px;
-        border-radius: 50%;
-        border: 1px solid #e0e0e0;
-        background: #fff;
-        color: #80868b;
-        cursor: pointer;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        padding: 0;
-        transition: border-color .12s ease, color .12s ease;
-    }
-    .backchip:hover { border-color: #1a73e8; color: #1a73e8; }
 </style>

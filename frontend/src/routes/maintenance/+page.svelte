@@ -1,9 +1,13 @@
 <script>
-    import { onDestroy } from 'svelte';
+    import { onDestroy, onMount } from 'svelte';
 
     const API_URL = "/api";
 
     let status = null;
+    let who = null; // authenticated tenant, for showing own paths
+    onMount(async () => {
+        try { who = await (await fetch(`${API_URL}/whoami`)).json(); } catch { /* gate handles it */ }
+    });
     let backupResult = null;
     let backingUp = false;
     let err = "";
@@ -103,7 +107,7 @@
         <p>
             This drive holds your <em>complete</em> email archive; Gmail only decides what's <em>new</em>.
             A merge never removes anything: it takes the union of every dropped file plus the existing
-            archive (kept apart in <code>archive/</code>, so the drop folder can never disturb it), newest
+            archive (kept apart in <code>archive/{who ? who.slug + '/' : '…'}</code>, so the drop folder can never disturb it), newest
             version wins for duplicates, and it lands atomically — a failed merge can't damage what you have.
         </p>
     </section>
@@ -111,7 +115,7 @@
     <section class="step">
         <h2><span class="num">1</span> Bring the new Takeout in</h2>
         <p>
-            Unzip the new Gmail Takeout and copy its <code>.mbox</code> file(s) into <code>data/</code>
+            Unzip the new Gmail Takeout and copy its <code>.mbox</code> file(s) into <code>data/{who ? who.slug + '/' : '…'}</code>
             on this drive. That folder is a drop inbox — it's emptied in step 4 and safe to tidy anytime.
         </p>
     </section>
@@ -142,7 +146,7 @@
         <h2><span class="num">4</span> Verify, then tidy</h2>
         <p>
             Check the stats above before trusting anything: count should be ≥ last time, latest should
-            be the new export's date. Then empty <code>data/</code> freely — everything is in the archive now.
+            be the new export's date. Then empty <code>data/{who ? who.slug + '/' : '…'}</code> freely — everything is in the archive now.
         </p>
     </section>
 
