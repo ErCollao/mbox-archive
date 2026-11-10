@@ -29,12 +29,14 @@
     let loading = false;
     let expanded = false;
     let drawerOpen = false;
+    let helpOpen = false;
 
     // ---------- vim-ish keyboard navigation (main view only) ----------
     const PANE_ORDER = ['left', 'list', 'email'];
     let pane = null;          // which pane owns j/k/space right now
     let listIdx = -1;         // cursor over emails
     let leftIdx = 0;          // cursor over filter buttons (index into visible DOM)
+    let stickBottom = false;  // load-more in flight: ride the cursor to the new end
     let leftPane, listEl, searchInput;
 
     const TEXT_INPUT_TYPES = ['text', 'search', 'email', 'password', 'number', 'tel', 'url', ''];
@@ -122,19 +124,48 @@
         paintLeftCursor();
     }
 
+    function morePending() {
+        return mode === 'inbox' ? hasMore : moreSearch;
+    }
+
+    function nextPage() {
+        stickBottom = true;
+        if (mode === 'inbox') loadInbox(false);
+        else search(false);
+    }
+
+    async function paintListCursor() {
+        await tick();
+        if (!listEl) return;
+        const cur = listEl.querySelector('.email-item.kcursor');
+        if (!cur) return;
+        const rows = listEl.querySelectorAll('.email-item');
+        const moreBtn = listEl.querySelector('.load-more button');
+        // at the bottom, keep the Load-more button (and thus a hint of what
+        // is coming) on screen instead of gluing the last row to the edge
+        const target = (moreBtn && cur === rows[rows.length - 1]) ? moreBtn : cur;
+        target.scrollIntoView({ block: 'nearest' });
+    }
+
     async function moveList(dir) {
         if (!emails.length) return;
+        if (dir === 1 && listIdx === emails.length - 1 && morePending() && !loading) {
+            nextPage(); // jamming j keeps loading pages
+            return;
+        }
         listIdx = Math.max(0, Math.min(listIdx + dir, emails.length - 1));
-        await tick();
-        listEl?.querySelector('.email-item.kcursor')?.scrollIntoView({ block: 'nearest' });
+        await paintListCursor();
     }
 
     async function jump(where) {
         if (pane === null) pane = 'list'; // cold start: gg/G own the middle, like j/k
         if (pane === 'list' && emails.length) {
+            if (where === 'bottom' && listIdx === emails.length - 1 && morePending() && !loading) {
+                nextPage(); // G at the end loads the next page, cursor follows
+                return;
+            }
             listIdx = where === 'top' ? 0 : emails.length - 1;
-            await tick();
-            listEl?.querySelector('.email-item.kcursor')?.scrollIntoView({ block: 'nearest' });
+            await paintListCursor();
         } else if (pane === 'left') {
             leftIdx = where === 'top' ? 0 : leftItems().length - 1;
             paintLeftCursor();
@@ -157,6 +188,11 @@
         }
         if (e.ctrlKey || e.metaKey || e.altKey) return;
         const k = KEYMAP[e.key] ?? e.key;
+        if (k === '?') { helpOpen = !helpOpen; return; }
+        if (helpOpen) {
+            if (k === 'Escape') helpOpen = false;
+            return; // help eats everything else while it is up
+        }
         if (k === 'Escape') {
             // in the email pane, Esc first exits the reading (the Back button
             // is desktop-hidden, so this is the only way out of a thread);
@@ -498,7 +534,8 @@
         if (reset) {
             offset = 0;
             emails = [];
-            listIdx = -1; // new context (boot, filters, cleared search): no stale cursor
+            listIdx = -1;
+            stickBottom = false; // new context (boot, filters, cleared search): no stale cursor
             if (pane === 'email') pane = 'list';
         }
         mode = "inbox";
@@ -512,6 +549,7 @@
             emails = reset ? data : emails.concat(data);
             offset += data.length;
             hasMore = data.length === 100;
+            if (stickBottom) { listIdx = emails.length - 1; stickBottom = false; paintListCursor(); }
         } catch (e) {
             console.error(e);
         } finally {
@@ -527,7 +565,8 @@
         if (reset) {
             searchOffset = 0;
             emails = [];
-            listIdx = -1; // a new result set is a new context: no stale cursor
+            listIdx = -1;
+            stickBottom = false; // a new result set is a new context: no stale cursor
             if (pane === 'email') pane = 'list';
         }
         loading = true;
@@ -547,6 +586,7 @@
             emails = reset ? data : emails.concat(data);
             searchOffset += data.length;
             moreSearch = data.length === 50;
+            if (stickBottom) { listIdx = emails.length - 1; stickBottom = false; paintListCursor(); }
         } catch (e) {
             console.error(e);
         } finally {
@@ -981,6 +1021,28 @@
 
 <div class="kbd-frame" class:show={pane === 'email'} style={frameStyle}></div>
 
+<button class="help-key" title="Keyboard shortcuts (?)" aria-label="Toggle keyboard shortcuts" on:click={() => helpOpen = !helpOpen}>?</button>
+
+{#if helpOpen}
+    <div class="help-backdrop" role="presentation" on:click|self={() => helpOpen = false}>
+        <div class="help-card" role="dialog" aria-modal="true" aria-label="Keyboard shortcuts">
+            <h3>Keyboard shortcuts</h3>
+            <p class="sub">Active in the archive view only — and never while your cursor is typing in a field (there, <span class="mono">h j k l</span> are just letters).</p>
+            <div class="shortcut-rows">
+                <div><span class="keys"><kbd>h</kbd><kbd>←</kbd> / <kbd>l</kbd><kbd>→</kbd></span><span>focus previous / next pane</span></div>
+                <div><span class="keys"><kbd>j</kbd><kbd>↓</kbd> / <kbd>k</kbd><kbd>↑</kbd></span><span>move within the focused pane</span></div>
+                <div><span class="keys"><kbd>Enter</kbd> / <kbd>Space</kbd></span><span>open email · apply highlighted filter · toggle full screen (email pane)</span></div>
+                <div><span class="keys"><kbd>g</kbd><kbd>g</kbd> / <kbd>G</kbd></span><span>jump to first / last item of the focused pane</span></div>
+                <div><span class="keys"><kbd>/</kbd></span><span>search — <kbd>Enter</kbd> runs it, <kbd>Esc</kbd> leaves the field</span></div>
+                <div><span class="keys"><kbd>f</kbd></span><span>full screen the open email</span></div>
+                <div><span class="keys"><kbd>Esc</kbd></span><span>leave an open email · otherwise hide all highlights</span></div>
+                <div><span class="keys"><kbd>?</kbd></span><span>this help</span></div>
+            </div>
+            <button on:click={() => helpOpen = false}>Close</button>
+        </div>
+    </div>
+{/if}
+
 <style>
     :global(body) {
         margin: 0;
@@ -1379,6 +1441,67 @@
     .kbd-frame.show {
         visibility: visible;
     }
+    .help-key {
+        position: fixed;
+        left: 0.8rem;
+        bottom: 0.8rem;
+        z-index: 15;
+        width: 1.7rem;
+        height: 1.7rem;
+        border-radius: 50%;
+        border: 1px solid #d0d3d8;
+        background: #fff;
+        color: #80868b;
+        font-size: 0.85rem;
+        cursor: pointer;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+    }
+    .help-key:hover { color: #1a73e8; border-color: #1a73e8; }
+    .help-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        background: rgba(32, 33, 36, 0.45);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .help-card {
+        background: #fff;
+        border-radius: 10px;
+        padding: 1.4rem 1.6rem;
+        width: min(560px, 92vw);
+        max-height: 86vh;
+        overflow-y: auto;
+        box-shadow: 0 8px 40px rgba(0, 0, 0, 0.3);
+        color: #333;
+    }
+    .help-card h3 { margin: 0 0 0.4rem; font-size: 1.05rem; }
+    .help-card .sub { font-size: 0.78rem; color: #666; margin: 0 0 1rem; }
+    .shortcut-rows { display: flex; flex-direction: column; gap: 0.55rem; font-size: 0.82rem; }
+    .shortcut-rows > div { display: flex; gap: 0.9rem; align-items: baseline; }
+    .shortcut-rows .keys { flex: 0 0 11.5rem; white-space: nowrap; }
+    kbd, .mono {
+        display: inline-block;
+        background: #f1f3f4;
+        border: 1px solid #dadce0;
+        border-bottom-width: 2px;
+        border-radius: 4px;
+        padding: 0 0.35rem;
+        font-family: ui-monospace, monospace;
+        font-size: 0.75rem;
+        color: #202124;
+    }
+    .help-card > button {
+        margin-top: 1.2rem;
+        border: 1px solid #d0d3d8;
+        background: #fff;
+        border-radius: 6px;
+        padding: 0.35rem 0.9rem;
+        cursor: pointer;
+        font-size: 0.8rem;
+    }
+    .help-card > button:hover { border-color: #1a73e8; color: #1a73e8; }
     .email-item.kcursor {
         outline: 2px solid #1a73e8;
         outline-offset: -2px;

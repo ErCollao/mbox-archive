@@ -13,19 +13,24 @@ const MESSAGES = [
 ];
 const THREAD = { tid: 't2', subject: 'Second', messages: [{ id: '1', subject: 'S', from: 'b@x', date: '2026-01-02T00:00:00Z', snippet: '', attachments: false }, { id: '2', subject: 'S', from: 'c@x', date: '2026-01-03T00:00:00Z', snippet: '', attachments: false }] };
 
-function mockFetch() {
+function mockFetch(big = false) {
     const res = (body, text) => ({
         ok: true, status: 200,
         json: async () => body,
         text: async () => text ?? JSON.stringify(body),
     });
+    const row = (i) => ({ tid: 't' + i, subject: 'M' + i, from: 'a@x', date: '2026-01-01T00:00:00Z', count: 1, matched: 0, attachments: false });
     const calls = [];
     const f = (url, opts) => {
         calls.push(url);
         const u = String(url);
         if (u.startsWith('/api/whoami')) return Promise.resolve(res({ slug: 'd', name: 'D' }));
         if (u.startsWith('/api/filters')) return Promise.resolve(res({ labels: [['Category Personal', 5], ['Category Social', 7], ['Inbox', 3]], min_ts: 0, max_ts: 86400000 * 40, total: 2 }));
-        if (u.startsWith('/api/messages')) return Promise.resolve(res(MESSAGES));
+        if (u.startsWith('/api/messages')) {
+            if (big && u.includes('offset=100')) return Promise.resolve(res([row(100), row(101), row(102)]));
+            if (big) return Promise.resolve(res(Array.from({ length: 100 }, (_, i) => row(i))));
+            return Promise.resolve(res(MESSAGES));
+        }
         if (u.startsWith('/api/search')) return Promise.resolve(res([MESSAGES[0]]));
         if (u.startsWith('/api/thread')) return Promise.resolve(res(THREAD));
         if (/\/api\/email\/[^/]+\/meta/.test(u)) return Promise.resolve(res({ id: '1', subject: 'S', from: 'b@x', to: ['me@x'], date: '2026-01-02T00:00:00Z', labels: [], attachments: [], inline_images: 0 }));
@@ -41,8 +46,8 @@ async function key(win, k, opts = {}) {
     await tick();
 }
 
-async function mount() {
-    const calls = mockFetch();
+async function mount(big = false) {
+    const calls = mockFetch(big);
     render(Home);
     await waitFor(() => document.querySelector('.email-item'));
     // settle the transient facet-triggered refetch that briefly empties the list
@@ -170,6 +175,57 @@ describe('vim key navigation', () => {
         });
         await waitFor(() => expect(document.querySelector('.back-btn')).toBeTruthy());
         expect(document.querySelector('.kbd-focus')).toBeFalsy(); // mouse mode: no pane ring
+    });
+
+    it('G at the bottom loads the next page and the cursor rides along', async () => {
+        await mount(true); // 100 rows, then 3 more
+        await key(window, 'l');
+        await key(window, 'G'); // jump to end (row 99)
+        let rows = document.querySelectorAll('.email-item');
+        expect(rows.length).toBe(100);
+        expect(rows[99].classList.contains('kcursor')).toBe(true);
+
+        await key(window, 'G'); // at end -> load more
+        await waitFor(() => expect(document.querySelectorAll('.email-item').length).toBe(103));
+        rows = document.querySelectorAll('.email-item');
+        expect(rows[102].classList.contains('kcursor')).toBe(true);
+
+        await key(window, 'j'); // no more pages: stays put, no crash
+        rows = document.querySelectorAll('.email-item');
+        expect(rows.length).toBe(103);
+        expect(rows[102].classList.contains('kcursor')).toBe(true);
+    });
+
+    it('j at the bottom also triggers the next page', async () => {
+        await mount(true);
+        await key(window, 'l');
+        await key(window, 'G'); // end of first page
+        await key(window, 'j'); // overflow -> load
+        await waitFor(() => expect(document.querySelectorAll('.email-item').length).toBe(103));
+        expect(document.querySelectorAll('.email-item')[102].classList.contains('kcursor')).toBe(true);
+    });
+
+    it('? opens the shortcut help, swallows nav keys, and closes on ?/Escape/Close', async () => {
+        await mount();
+        await key(window, '?');
+        expect(document.querySelector('.help-card')).toBeTruthy();
+        await key(window, 'j'); // help eats navigation while open
+        expect(document.querySelector('.help-card')).toBeTruthy();
+        expect(document.querySelector('.email-item.kcursor')).toBeFalsy();
+        await key(window, 'Escape');
+        expect(document.querySelector('.help-card')).toBeFalsy();
+        await key(window, '?');
+        expect(document.querySelector('.help-card')).toBeTruthy();
+        await key(window, '?');
+        expect(document.querySelector('.help-card')).toBeFalsy();
+    });
+
+    it('the bottom-left key opens and the Close button shuts the help', async () => {
+        await mount();
+        await fireEvent.click(document.querySelector('.help-key'));
+        expect(document.querySelector('.help-card')).toBeTruthy();
+        await fireEvent.click(document.querySelector('.help-card button'));
+        expect(document.querySelector('.help-card')).toBeFalsy();
     });
 
     it('space activates the focused left-pane filter', async () => {
