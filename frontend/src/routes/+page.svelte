@@ -79,11 +79,14 @@
     // shadow (covered by its own content) nor an outset one reads as a frame.
     // A fixed overlay traced onto its rect does, and never scrolls away.
     let frameStyle = "";
-    function updateFrame() {
-        if (pane === 'email' && mailPane) {
-            const r = mailPane.getBoundingClientRect();
-            frameStyle = `left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;`;
-        }
+    async function updateFrame() {
+        if (pane !== 'email') return;
+        // reactive runs before the DOM flush — measuring now would freeze the
+        // pre-toggle geometry (e.g. the old rect lingering over full screen)
+        await tick();
+        if (pane !== 'email' || !mailPane) return;
+        const r = mailPane.getBoundingClientRect();
+        frameStyle = `left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;`;
     }
     $: if (pane !== null || expanded) updateFrame(); // guard lives inside
 
