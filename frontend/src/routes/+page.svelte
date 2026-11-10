@@ -828,7 +828,7 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 1rem 1rem 0.4rem;
+        padding: 1.5rem 1rem 0.5rem;
     }
     .title-row h1 {
         margin: 0;
@@ -1235,9 +1235,8 @@
         display: flex;
         align-items: center;
         gap: 0.7rem;
-        padding: 1rem 2rem 0.55rem;
+        padding: 1.5rem 2rem 0.5rem;
         margin: 0 -2rem 0.6rem;
-        border-bottom: 1px solid #eee;
     }
     .head-btn {
         flex-shrink: 0;
