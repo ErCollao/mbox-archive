@@ -1,5 +1,6 @@
 <script>
     import { onMount } from 'svelte';
+    import { cropToJpeg } from '$lib/portrait.js';
 
     let me = null;         // { slug, name, has_portrait }
     let bust = 0;          // cache-buster for the portrait image
@@ -27,23 +28,6 @@
         err = isError ? message : "";
         note = isError ? "" : message;
         setTimeout(() => { err = note = ""; }, 5000);
-    }
-
-    /// Center-square crop at a sane size, output JPEG. The chooser renders
-    /// portraits square, so we crop here instead of storing a 12 MB original
-    /// and letting CSS fake it. Transparent PNGs get a white mat.
-    function cropToJpeg(img) {
-        const side = Math.min(img.naturalWidth, img.naturalHeight);
-        const c = document.createElement('canvas');
-        c.width = 512;
-        c.height = 512;
-        const ctx = c.getContext('2d');
-        ctx.fillStyle = '#fff';
-        ctx.fillRect(0, 0, 512, 512);
-        ctx.drawImage(img,
-            (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side,
-            0, 0, 512, 512);
-        return c.toDataURL('image/jpeg', 0.9);
     }
 
     async function pickPhoto(e) {
