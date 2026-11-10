@@ -404,7 +404,7 @@ mod tests {
         fs::create_dir_all(d.join("daniel")).unwrap();
         assert!(find_portrait(&d, "daniel").is_none());
         save_portrait(&d, "daniel", b"\xff\xd8\xff\xfffake", "jpg").unwrap();
-        let (p, mime) = find_portrait(&d, "daniel").unwrap();
+        let (_p, mime) = find_portrait(&d, "daniel").unwrap();
         assert_eq!(mime, "image/jpeg");
         // extension switch must not leave a stale sibling behind
         save_portrait(&d, "daniel", b"\x89PNG fake", "png").unwrap();

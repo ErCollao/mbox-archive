@@ -1842,6 +1842,11 @@ mod integration_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn body_str(r: Response) -> String {
+        let bytes = axum::body::to_bytes(r.into_body(), 1 << 22).await.unwrap();
+        String::from_utf8_lossy(&bytes).to_string()
+    }
+
     #[tokio::test]
     async fn anonymous_and_bad_credentials_are_rejected() {
         let env = Env::new("reject");
@@ -2028,5 +2033,219 @@ mod integration_tests {
             assert_eq!(r.status(), StatusCode::BAD_REQUEST, "accepted name {:?}", name);
         }
         assert_eq!(auth::read_profile(&env.profiles, "daniel").unwrap().name, "Daniel");
+    }
+
+    // ---- archive API: fixtures + helpers -------------------------------
+
+    impl Env {
+        fn mail(&self, slug: &str, file: &str, content: &str) {
+            let dir = self.data.join(slug);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(file), content).unwrap();
+        }
+    }
+
+    /// A two-message thread (reply chains to q1) plus, in a second file, a
+    /// newer solo message and an edited copy of q1 for merge dedup tests.
+    /// mboxshell threads solely on Gmail's `X-GM-THRID`, which real Takeout
+    /// exports carry on every message — so the fixture does too.
+    const THREAD_MBOX: &str = r#"From dave@example.com Mon Jan  5 10:00:00 2026
+From: Dave Liang <dave@example.com>
+To: me@example.com
+Subject: Quarterly report
+Date: Mon, 5 Jan 2026 10:00:00 +0000
+Message-ID: <q1@example.com>
+X-GM-THRID: 18ab3c4d5e6f7081
+
+Q1 numbers are in. See the quarterly report summary for details.
+
+From me@example.com Tue Jan  6 09:00:00 2026
+From: Me <me@example.com>
+To: dave@example.com
+Subject: Re: Quarterly report
+Date: Tue, 6 Jan 2026 09:00:00 +0000
+Message-ID: <q2@example.com>
+In-Reply-To: <q1@example.com>
+References: <q1@example.com>
+X-GM-THRID: 18ab3c4d5e6f7081
+
+Thanks, reviewing it now.
+"#;
+
+    const LUNCH_MBOX: &str = r#"From dave@example.com Thu Jan  8 12:00:00 2026
+From: Dave Liang <dave@example.com>
+To: me@example.com
+Subject: Lunch plans
+Date: Thu, 8 Jan 2026 12:00:00 +0000
+Message-ID: <l1@example.com>
+
+Pizza or sushi, decide quickly.
+"#;
+
+    const UPDATE_MBOX: &str = r#"From dave@example.com Fri Jan  9 12:00:00 2026
+From: Dave Liang <dave@example.com>
+To: me@example.com
+Subject: Quarterly report final
+Date: Fri, 9 Jan 2026 12:00:00 +0000
+Message-ID: <q1@example.com>
+X-GM-THRID: 18ab3c4d5e6f7081
+
+Same message id, corrected body text here.
+"#;
+
+    async fn scan(app: &Router, cookie: &str) {
+        let r = send(app, req("POST", "/api/scan", Body::empty(), Some(cookie), false)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    async fn post(app: &Router, cookie: &str, uri: &str) -> StatusCode {
+        send(app, req("POST", uri, Body::empty(), Some(cookie), false)).await.status()
+    }
+
+    async fn wait_indexed(app: &Router, cookie: &str, total: u64) -> serde_json::Value {
+        for _ in 0..200 {
+            let (_, st) = get_json(app, "/api/status", Some(cookie)).await;
+            if !st["busy"].as_bool().unwrap() && st["total"].as_u64() == Some(total) {
+                return st;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("index never reached total={total}");
+    }
+
+    async fn threads(app: &Router, cookie: &str, uri: &str) -> serde_json::Value {
+        let (s, v) = get_json(app, uri, Some(cookie)).await;
+        assert_eq!(s, StatusCode::OK, "{uri}");
+        v
+    }
+
+    /// Thread ids are raw Message-IDs (`<a1@x>`), illegal bare in a URI.
+    fn enc(s: &str) -> String {
+        s.replace('%', "%25").replace('<', "%3C").replace('>', "%3E").replace(' ', "%20")
+    }
+
+    #[tokio::test]
+    async fn scan_indexes_threads_email_and_facets() {
+        let env = Env::new("scanapi");
+        env.add("daniel", "Daniel", "daniel");
+        // one file: with several raw mboxes and no archive, scan indexes only the newest
+        env.mail("daniel", "full.mbox", &format!("{THREAD_MBOX}\n{LUNCH_MBOX}"));
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+
+        scan(&app, &cookie).await;
+        let st = wait_indexed(&app, &cookie, 3).await;
+        assert_eq!(st["busy"], false);
+
+        let list = threads(&app, &cookie, "/api/messages").await;
+        assert_eq!(list.as_array().unwrap().len(), 2, "two threads: reply folded into root");
+        assert_eq!(list[0]["subject"], "Lunch plans", "newest thread first");
+        let q = &list[1];
+        assert_eq!(q["subject"], "Quarterly report");
+        assert_eq!(q["count"], 2);
+        assert_eq!(q["from"], "Dave Liang <dave@example.com>");
+
+        let (_, fac) = get_json(&app, "/api/filters", Some(&cookie)).await;
+        assert_eq!(fac["total"], 3);
+        assert!(fac["min_ts"].as_i64().unwrap() < fac["max_ts"].as_i64().unwrap());
+
+        let tid = q["tid"].as_str().unwrap();
+        let (_, det) = get_json(&app, &format!("/api/thread?tid={}", enc(tid)), Some(&cookie)).await;
+        let msgs = det["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(
+            msgs[0]["date"].as_str().unwrap() < msgs[1]["date"].as_str().unwrap(),
+            "thread messages ascending"
+        );
+
+        let id = msgs[0]["id"].as_str().unwrap();
+        let r = send(&app, req("GET", &format!("/api/email/{id}"), Body::empty(), Some(&cookie), false)).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_str(r).await.contains("quarterly report summary"));
+        let (_, meta) = get_json(&app, &format!("/api/email/{id}/meta"), Some(&cookie)).await;
+        assert_eq!(meta["subject"], "Quarterly report");
+        assert_eq!(meta["attachments"].as_array().unwrap().len(), 0);
+
+        let r = send(&app, req("GET", "/api/thread?tid=nope", Body::empty(), Some(&cookie), false)).await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn search_matches_subject_but_bodies_only_when_requested() {
+        let env = Env::new("searchapi");
+        env.add("daniel", "Daniel", "daniel");
+        env.mail("daniel", "full.mbox", &format!("{THREAD_MBOX}\n{LUNCH_MBOX}"));
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+        scan(&app, &cookie).await;
+        wait_indexed(&app, &cookie, 3).await;
+
+        let r = threads(&app, &cookie, "/api/search?q=quarterly").await;
+        assert_eq!(r.as_array().unwrap().len(), 1, "subject hit folds to one thread");
+        assert_eq!(r[0]["subject"], "Quarterly report");
+        assert!(r[0]["matched"].as_u64().unwrap() >= 1);
+
+        let r = threads(&app, &cookie, "/api/search?q=from:dave").await;
+        assert_eq!(r.as_array().unwrap().len(), 2, "both threads are from dave (one message each)");
+
+        // "summary" exists only in the body: absent by default, found with body=1
+        let r = threads(&app, &cookie, "/api/search?q=summary").await;
+        assert_eq!(r.as_array().unwrap().len(), 0);
+        let r = threads(&app, &cookie, "/api/search?q=summary&body=1").await;
+        assert_eq!(r.as_array().unwrap().len(), 1);
+
+        let r = threads(&app, &cookie, "/api/search?q=zzq-nonexistent").await;
+        assert_eq!(r.as_array().unwrap().len(), 0);
+        let r = threads(&app, &cookie, "/api/search?q=").await;
+        assert_eq!(r.as_array().unwrap().len(), 0, "empty query never scans");
+    }
+
+    #[tokio::test]
+    async fn merge_dedups_by_message_id_and_rescan_reads_the_archive() {
+        let env = Env::new("mergeapi");
+        env.add("daniel", "Daniel", "daniel");
+        env.mail("daniel", "01.mbox", THREAD_MBOX);
+        env.mail("daniel", "02.mbox", LUNCH_MBOX);
+        env.mail("daniel", "03.mbox", UPDATE_MBOX);
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+
+        assert_eq!(post(&app, &cookie, "/api/merge").await, StatusCode::OK);
+        for _ in 0..200 {
+            if !env.archive.join("daniel").join("merged.mbox").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            } else {
+                break;
+            }
+        }
+        let merged = fs::read_to_string(env.archive.join("daniel").join("merged.mbox")).expect("merged.mbox");
+        assert_eq!(merged.matches("Message-ID: <q1@example.com>").count(), 1, "duplicate id collapsed");
+        assert!(merged.contains("<l1@example.com>") && merged.contains("<q2@example.com>"));
+
+        scan(&app, &cookie).await;
+        let st = wait_indexed(&app, &cookie, 3).await;
+        assert_eq!(st["source"], "merged.mbox", "scan prefers the archive over raw exports");
+    }
+
+    #[tokio::test]
+    async fn tenants_only_ever_see_their_own_archive() {
+        let env = Env::new("scopeapi");
+        env.add("daniel", "Daniel", "daniel");
+        env.add("hajni", "Hajni", "hajni");
+        env.mail("daniel", "export.mbox", THREAD_MBOX);
+        env.mail("hajni", "export.mbox", LUNCH_MBOX);
+        let app = env.app();
+        let d = cookie_of(&login(&app, "daniel", "daniel").await);
+        let h = cookie_of(&login(&app, "hajni", "hajni").await);
+        scan(&app, &d).await;
+        scan(&app, &h).await;
+        wait_indexed(&app, &d, 2).await;
+        wait_indexed(&app, &h, 1).await;
+
+        let list = threads(&app, &h, "/api/messages").await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        assert_eq!(list[0]["subject"], "Lunch plans");
+        let r = threads(&app, &h, "/api/search?q=quarterly").await;
+        assert_eq!(r.as_array().unwrap().len(), 0, "another tenant's mail never leaks into search");
     }
 }
