@@ -16,12 +16,18 @@ backup/<slug>/                 gzip backups from the maintenance page
 The app refuses to start with zero valid profiles (fail-closed), and a broken
 `profile.json` only skips that one profile — it never takes others down.
 
-## Passwords & photos
+## Passwords, names & photos
 
-In-app: the avatar chip (top-left) opens `/profile` — change the password there,
-upload a portrait (JPEG/PNG/WebP, ≤12 MB; it shows up on the sign-in chooser).
-Changes are written straight to `profiles/<slug>/profile.json` and take effect
-immediately, no restart.
+In-app: the avatar chip (top-left) opens `/profile` — set your display name
+there, change the password, or upload a portrait (JPEG/PNG/WebP, ≤12 MB; it
+shows up on the sign-in chooser). Changes are written straight to
+`profiles/<slug>/profile.json` and take effect immediately, no restart —
+the sign-in screen and the archive corner re-read the name from disk, so a
+rename never logs anyone out.
+
+Changing the *password* is the revoke switch: session cookies carry a
+fingerprint of the secret they were issued against, so every older session
+dies the moment the password changes (your current one is re-issued).
 
 Secrets are bcrypt hashes. Legacy sha256 entries are upgraded to bcrypt
 automatically on next successful login.
@@ -58,7 +64,8 @@ Merge → Re-scan → verify → Backup, with the real folder names filled in.
 
 ## Threat model
 
-LAN-only. One shared password per profile, verified against a saltless sha256 over
-plain HTTP behind the home router — this is a family appliance, not a vault.
-Sessions are HMAC-signed year cookies (`archive/session.key`); delete that file to
-log everyone out at once.
+LAN-only. One shared password per profile, bcrypt-verified over plain HTTP
+behind the home router — this is a family appliance, not a vault.
+Sessions are HMAC-signed year cookies carrying `slug:expiry:fingerprint`
+(`archive/session.key`); delete that file to log everyone out at once, or
+change a password to evict just that one person's older sessions.
