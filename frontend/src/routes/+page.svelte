@@ -1,5 +1,5 @@
 <script>
-    import { onMount } from 'svelte';
+    import { onMount, tick } from 'svelte';
 
     let query = "";
     let emails = [];
@@ -29,6 +29,183 @@
     let loading = false;
     let expanded = false;
     let drawerOpen = false;
+
+    // ---------- vim-ish keyboard navigation (main view only) ----------
+    const PANE_ORDER = ['left', 'list', 'email'];
+    let pane = null;          // which pane owns j/k/space right now
+    let listIdx = -1;         // cursor over emails
+    let leftIdx = 0;          // cursor over filter buttons (index into visible DOM)
+    let leftPane, listEl, searchInput;
+
+    const TEXT_INPUT_TYPES = ['text', 'search', 'email', 'password', 'number', 'tel', 'url', ''];
+
+    // clicking inside the sandboxed email iframe steals key focus from the
+    // document — events then never reach us. Yank it back the moment focus
+    // moves into a frame (focusout on the parent is the reliable signal;
+    // window blur is a fallback for when the whole tab loses focus).
+    function reclaimKeys(e) {
+        const stolen = e?.relatedTarget?.tagName === 'IFRAME' ? e.relatedTarget : document.activeElement;
+        if (stolen && stolen.tagName === 'IFRAME') setTimeout(() => stolen.blur(), 0);
+    }
+    onMount(() => {
+        document.addEventListener('focusout', reclaimKeys);
+        window.addEventListener('blur', reclaimKeys);
+        const remeasure = () => updateFrame();
+        window.addEventListener('resize', remeasure);
+        window.addEventListener('mouseup', remeasure); // column drags end here
+        return () => {
+            document.removeEventListener('focusout', reclaimKeys);
+            window.removeEventListener('blur', reclaimKeys);
+            window.removeEventListener('resize', remeasure);
+            window.removeEventListener('mouseup', remeasure);
+        };
+    });
+
+    function isTextEntry(el) {
+        if (!el || !el.tagName) return false;
+        const tag = el.tagName.toUpperCase();
+        if (tag === 'TEXTAREA' || el.isContentEditable) return true;
+        if (tag !== 'INPUT') return false;
+        // checkboxes and sliders keep focus after clicks/drags — hjkl must
+        // keep meaning navigation there, only typing fields are exempt
+        return TEXT_INPUT_TYPES.includes((el.getAttribute('type') || 'text').toLowerCase());
+    }
+
+    // The email pane sits flush against the viewport edge, so neither an inset
+    // shadow (covered by its own content) nor an outset one reads as a frame.
+    // A fixed overlay traced onto its rect does, and never scrolls away.
+    let frameStyle = "";
+    function updateFrame() {
+        if (pane === 'email' && mailPane) {
+            const r = mailPane.getBoundingClientRect();
+            frameStyle = `left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;`;
+        }
+    }
+    $: if (pane !== null || expanded) updateFrame(); // guard lives inside
+
+    function cyclePane(dir) {
+        if (pane === null) { pane = dir > 0 ? 'list' : 'left'; }
+        else {
+            // stop at the edges — rotating confused people expecting a row
+            // of panes, not a ring
+            const i = Math.max(0, Math.min(PANE_ORDER.length - 1, PANE_ORDER.indexOf(pane) + dir));
+            pane = PANE_ORDER[i];
+        }
+        if (pane === 'left') paintLeftCursor();
+    }
+
+    function leftItems() {
+        return leftPane ? Array.from(leftPane.querySelectorAll('button.label-item')) : [];
+    }
+
+    function paintLeftCursor() {
+        const items = leftItems();
+        leftIdx = Math.max(0, Math.min(leftIdx, items.length - 1));
+        items.forEach((el, i) => el.classList.toggle('kcursor', i === leftIdx && pane === 'left'));
+        items[leftIdx]?.scrollIntoView({ block: 'nearest' });
+    }
+
+    async function moveLeft(dir) {
+        const items = leftItems();
+        if (!items.length) return;
+        leftIdx = Math.max(0, Math.min(leftIdx + dir, items.length - 1));
+        items.forEach((el, i) => el.classList.toggle('kcursor', i === leftIdx));
+        items[leftIdx].scrollIntoView({ block: 'nearest' });
+    }
+
+    async function activateLeft() {
+        const items = leftItems();
+        const el = items[leftIdx];
+        if (!el) return;
+        el.click(); // same handler the mouse would fire (toggle filter or expand)
+        await tick();
+        paintLeftCursor();
+    }
+
+    async function moveList(dir) {
+        if (!emails.length) return;
+        listIdx = Math.max(0, Math.min(listIdx + dir, emails.length - 1));
+        await tick();
+        listEl?.querySelector('.email-item.kcursor')?.scrollIntoView({ block: 'nearest' });
+    }
+
+    async function jump(where) {
+        if (pane === null) pane = 'list'; // cold start: gg/G own the middle, like j/k
+        if (pane === 'list' && emails.length) {
+            listIdx = where === 'top' ? 0 : emails.length - 1;
+            await tick();
+            listEl?.querySelector('.email-item.kcursor')?.scrollIntoView({ block: 'nearest' });
+        } else if (pane === 'left') {
+            leftIdx = where === 'top' ? 0 : leftItems().length - 1;
+            paintLeftCursor();
+        } else if (pane === 'email' && threadMsgs.length) {
+            loadMessage(where === 'top' ? threadMsgs[0].id : threadMsgs[threadMsgs.length - 1].id);
+        }
+    }
+
+    let gPending = 0;
+
+    const KEYMAP = { ArrowLeft: 'h', ArrowRight: 'l', ArrowDown: 'j', ArrowUp: 'k' };
+
+    function onKey(e) {
+        if (drawerOpen) return;
+        if (isTextEntry(e.target)) {
+            // Escape is the escape hatch out of typing mode — from then on
+            // hjkl mean navigation again.
+            if (e.key === 'Escape') e.target.blur();
+            return; // hjkl stay letters while typing
+        }
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        const k = KEYMAP[e.key] ?? e.key;
+        if (k === 'Escape') {
+            // in the email pane, Esc first exits the reading (the Back button
+            // is desktop-hidden, so this is the only way out of a thread);
+            // everywhere it is a pure visual hide — cursors keep their spots
+            if (pane === 'email' && selectedThread) closeThread();
+            pane = null;
+            return;
+        }
+        if (k === 'g') {
+            if (Date.now() - gPending < 600) { gPending = 0; jump('top'); }
+            else gPending = Date.now();
+            return;
+        }
+        if (k === 'G') { jump('bottom'); return; }
+        if (k === 'f') {
+            if (pane === 'email' && selectedThread) expanded = !expanded;
+            return;
+        }
+        gPending = 0;
+        if (k === '/') {
+            e.preventDefault();
+            searchInput?.focus();
+            searchInput?.select();
+            return;
+        }
+        if (k === 'h' || k === 'l') { cyclePane(k === 'l' ? 1 : -1); return; }
+        if (pane === null && (k === 'j' || k === 'k')) pane = 'list'; // cold start: j/k own the middle
+        if (pane === null) return;
+        if (k === 'j' || k === 'k') {
+            e.preventDefault();
+            const d = k === 'j' ? 1 : -1;
+            if (pane === 'left') moveLeft(d);
+            else if (pane === 'list') moveList(d);
+            else if (pane === 'email' && selectedThread) stepMessage(d);
+        } else if (k === 'Enter' || k === ' ') {
+            e.preventDefault(); // space must never scroll the page here
+            if (pane === 'left') activateLeft();
+            else if (pane === 'list' && emails[listIdx]) openThread(emails[listIdx].tid);
+            else if (pane === 'email' && selectedThread) expanded = !expanded;
+        }
+    }
+
+    // mouse clicks own the view too: keep the keyboard cursor honest
+    $: if (pane === 'list' && emails.length && listIdx >= emails.length) listIdx = emails.length - 1;
+    // the left cursor is imperative DOM, so it needs its own leave-behind sweep
+    $: if (pane !== 'left' && leftPane) {
+        leftPane.querySelectorAll('button.label-item.kcursor')
+            .forEach((el) => el.classList.remove('kcursor'));
+    }
 
     // Use relative path since we proxy through SvelteKit server
     const API_URL = "/api";
@@ -321,6 +498,8 @@
         if (reset) {
             offset = 0;
             emails = [];
+            listIdx = -1; // new context (boot, filters, cleared search): no stale cursor
+            if (pane === 'email') pane = 'list';
         }
         mode = "inbox";
         loading = true;
@@ -348,6 +527,8 @@
         if (reset) {
             searchOffset = 0;
             emails = [];
+            listIdx = -1; // a new result set is a new context: no stale cursor
+            if (pane === 'email') pane = 'list';
         }
         loading = true;
         mode = "search";
@@ -452,6 +633,7 @@
 
     function closeThread() {
         selectedThread = null;
+        if (pane === 'email') pane = 'list'; // the viewed pane vanished; hand keys back to the list
         threadMsgs = [];
         activeMsgId = null;
         expanded = false;
@@ -484,9 +666,10 @@
     <title>Mbox Archive</title>
 </svelte:head>
 <svelte:body class="app-shell" />
+<svelte:window on:keydown={onKey} />
 
 <div class="container" class:email-expanded={expanded} class:drawer-open={drawerOpen}>
-    <aside class="pane pane-settings">
+    <aside class="pane pane-settings" bind:this={leftPane} class:kbd-focus={pane === 'left'}>
         <div class="title-row">
             <div class="title-left">
                 {#if me}
@@ -593,16 +776,19 @@
         {/if}
     </aside>
 
-    <section class="pane pane-results">
+    <section class="pane pane-results" class:kbd-focus={pane === 'list'}>
         <div class="list-head">
             <div class="lh-row">
                 <button class="burger" title="Settings" on:click={() => drawerOpen = true}>≡</button>
                 <div class="searchbox">
                     <input
                         type="text"
+                        bind:this={searchInput}
                         bind:value={query}
                         placeholder="Search subject/sender, or from:dave subject:x"
-                        on:keydown={(e) => e.key === 'Enter' && search()}
+                        on:keydown={(e) => {
+                            if (e.key === 'Enter') { e.target.blur(); search(); }
+                        }}
                     />
                     <button on:click={search}>Search</button>
                 </div>
@@ -630,7 +816,7 @@
             </div>
         </div>
 
-        <div class="email-list">
+        <div class="email-list" bind:this={listEl}>
             {#if loading && emails.length === 0}
                 <div class="loading">
                     {mode === 'search' && searchBodies
@@ -647,11 +833,12 @@
                     <div class="empty">No emails match. Adjust filters, or drop .mbox files in data/ and re-scan.</div>
                 {/if}
             {:else}
-                {#each emails as t (t.tid)}
+                {#each emails as t, i (t.tid)}
                     <div
                         class="email-item"
                         class:selected={selectedThread && selectedThread.tid === t.tid}
-                        on:click={() => openThread(t.tid)}
+                        class:kcursor={pane === 'list' && i === listIdx}
+                        on:click={() => { listIdx = i; openThread(t.tid); }}
                     >
                         <div class="subject" title={t.subject}>{#if t.attachments}<span class="clip" title="Has attachments">📎</span>{/if}{t.subject || '(No Subject)'}{#if t.count > 1}<span class="badge">{mode === 'search' && t.matched ? `${t.matched}/${t.count}` : t.count}</span>{/if}</div>
                         <div class="meta">
@@ -676,7 +863,7 @@
         </div>
     </section>
 
-    <section class="pane pane-email" bind:this={mailPane} class:has-email={selectedThread !== null}>
+    <section class="pane pane-email" bind:this={mailPane} class:has-email={selectedThread !== null} class:kbd-focus={pane === 'email'}>
         {#if selectedThread}
             <div class="email-view">
                 <div class="msg-head">
@@ -792,6 +979,8 @@
     <button class="drawer-backdrop" aria-label="Close settings" on:click={() => drawerOpen = false}></button>
 {/if}
 
+<div class="kbd-frame" class:show={pane === 'email'} style={frameStyle}></div>
+
 <style>
     :global(body) {
         margin: 0;
@@ -816,6 +1005,9 @@
     .pane {
         height: 100vh;
         overflow-y: auto;
+        /* reserved so kbd focus can paint a solid top strip without ever
+           shifting content or losing to sticky children */
+        border-top: 4px solid transparent;
     }
     .pane-settings {
         background: #f2f2f2;
@@ -1167,6 +1359,39 @@
     }
     .email-item:hover {
         background: #eee;
+    }
+    /* keyboard navigation: focused pane lifts with a strip and drop shadow.
+       No inset ring: panes' opaque content paints over it unevenly — the
+       email pane gets a real frame via the fixed .kbd-frame overlay instead */
+    .pane.kbd-focus {
+        position: relative;
+        z-index: 8;
+        border-top-color: #1a73e8;
+        box-shadow: 0 2px 18px rgba(0, 0, 0, 0.18);
+    }
+    .kbd-frame {
+        position: fixed;
+        pointer-events: none;
+        z-index: 99;
+        box-shadow: inset 0 0 0 3px rgba(26, 115, 232, 0.75);
+        visibility: hidden;
+    }
+    .kbd-frame.show {
+        visibility: visible;
+    }
+    .email-item.kcursor {
+        outline: 2px solid #1a73e8;
+        outline-offset: -2px;
+        background: #e8f0fe;
+    }
+    /* :global so the imperatively-toggled class survives Svelte's pruning;
+       the element name lifts specificity over the scoped base rule */
+    :global(button.label-item.kcursor) {
+        outline: 2px solid #1a73e8;
+        outline-offset: -2px;
+        /* !important: Svelte's scoped base rules carry a double class token
+           and would otherwise out-specify this transient cursor */
+        background: #e8f0fe !important;
     }
     .email-item.selected {
         background: #e0e0e0;
