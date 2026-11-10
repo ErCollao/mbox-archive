@@ -7,3 +7,9 @@ archive/
 backup/
 /profiles/
 testdata/
+
+# disposable test-env runtime state (fixtures + scripts are tracked)
+test-env/profiles/
+test-env/data/
+test-env/archive/
+test-env/backup/

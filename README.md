@@ -108,10 +108,26 @@ there, `hjkl` are just letters.
 
 ## Testing
 
+Automated suites (no containers involved):
+
 ```sh
 cd frontend && npm test                       # vitest + @testing-library/svelte
 docker run --rm -v "$PWD/backend:/usr/src/app" -w /usr/src/app rust:slim cargo test
 ```
+
+Browser verification happens **only** against the disposable test environment
+— never against the live app on :3132, and never with the live profiles:
+
+```sh
+./test-env/up.sh                              # fixture-only stack on :3199 (API :8199)
+# login: tester / testpass — profile.json + sample.mbox are seeded from fixtures/
+./test-env/down.sh
+```
+
+`test-env/` runs as its own compose project (`-p mbxtest`) with its own
+volumes, ports, and profiles; its runtime dirs are gitignored. The live
+`profiles/`, `data/`, `archive/` folders are user data — treat them as
+production: read-only, or don't touch.
 
 ## Threat model
 

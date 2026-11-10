@@ -1,0 +1,24 @@
+services:
+  backend:
+    build: ../backend
+    volumes:
+      - ./profiles:/profiles
+      - ./data:/data
+      - ./archive:/archive
+      - ./backup:/backup
+      - test-index:/index
+    ports:
+      - "8199:3000"
+    restart: unless-stopped
+
+  frontend:
+    build: ../frontend
+    ports:
+      - "3199:3000"
+    environment:
+      - BACKEND_URL=http://backend:3000
+    depends_on:
+      - backend
+
+volumes:
+  test-index:

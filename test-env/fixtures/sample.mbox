@@ -1,0 +1,43 @@
+From alice@sample.test Mon Jan  5 10:00:00 2026
+From: Alice <alice@sample.test>
+To: tester-primary@sample.test
+Subject: Kickoff
+Date: Mon, 5 Jan 2026 10:00:00 +0000
+Message-ID: <k1@sample.test>
+X-GM-THRID: 2223334445556001
+X-Gmail-Labels: Inbox,Category Personal
+
+Kickoff thread root, addressed at the primary identity.
+
+From tester-primary@sample.test Tue Jan  6 09:00:00 2026
+From: Tester Primary <tester-primary@sample.test>
+To: alice@sample.test
+Subject: Re: Kickoff
+Date: Tue, 6 Jan 2026 09:00:00 +0000
+Message-ID: <k2@sample.test>
+X-GM-THRID: 2223334445556001
+X-Gmail-Labels: Inbox,Sent
+
+Reply sent from the primary identity.
+
+From news@aliases.example Wed Jan  7 12:00:00 2026
+From: Aliases R Us <news@aliases.example>
+To: tester-alias+newsletter@sample.test
+Subject: Weekly digest
+Date: Wed, 7 Jan 2026 12:00:00 +0000
+Message-ID: <n1@sample.test>
+X-GM-THRID: 2223334445556002
+X-Gmail-Labels: Inbox,Category Social
+
+Digest arriving at a plus-alias of the declared alias: must collapse to the base tag.
+
+From stranger@nowhere.test Thu Jan  8 12:00:00 2026
+From: Nobody <stranger@nowhere.test>
+To: alice@sample.test
+Subject: Cold outreach
+Date: Thu, 8 Jan 2026 12:00:00 +0000
+Message-ID: <c1@sample.test>
+X-GM-THRID: 2223334445556003
+X-Gmail-Labels: Inbox
+
+No declared identity involved: must stay untagged.
