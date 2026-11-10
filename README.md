@@ -53,6 +53,32 @@ docker compose restart backend
 Removing = delete the folder (archive/data stay on disk unless you also wipe them).
 Session cookies for deleted profiles die with them — they're checked against the roster.
 
+## Multiple accounts & aliases (Addresses)
+
+One person can declare several identities — separate Gmail accounts merged
+into one archive, or aliases that forward into it — under **your own addresses**
+in `/profile` (stored as `"addresses": [...]` in `profile.json`, lowercase,
+max 30). With **two or more** declared:
+
+- every email row gets a tag listing which of your addresses it involves
+  (`from`, `to`, or `cc`), and the sidebar grows an **Addresses** filter group;
+- with 0 or 1, everything stays exactly as before — no tags, no group.
+
+Mechanics worth knowing:
+
+- Tags are **derived at read time** from already-indexed header fields. They
+  are never written into the mbox or the index — adding an address relabels
+  the whole archive instantly (no rescan), removing one forgets it cleanly.
+- Gmail plus-aliases collapse: `hajni+news@gmail.com` counts as
+  `hajni@gmail.com` unless the exact plus-address is itself declared
+  (most-specific wins).
+- Merging separate Takeout exports just works: drop the `.mbox` files in
+  `data/<slug>/`, Merge, Re-scan. Mail that two of her accounts exchanged
+  exists once per copy with an identical Message-ID — dedup collapses each
+  message to a single copy, so mutual threads merge into one conversation
+  (tagged with both addresses), not two duplicates.
+- The search field also accepts `to:hajni@work.com`-style queries on its own.
+
 ## Running
 
 ```sh

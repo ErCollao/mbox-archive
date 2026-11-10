@@ -42,6 +42,9 @@ struct Tenant {
     /// fingerprint of the current secret; sessions carry it, so a password
     /// change revokes all older cookies. Reread at boot, updated live on change.
     epoch: Arc<RwLock<String>>,
+    /// declared identities (accounts & aliases); live so a profile edit
+    /// applies without restart, like the display name
+    addresses: Arc<RwLock<Vec<String>>>,
     inner: Arc<RwLock<AppStateInner>>,
     data_dir: PathBuf,
     archive_dir: PathBuf,
@@ -96,11 +99,17 @@ struct ThreadOut {
     count: usize,
     matched: usize,
     attachments: bool,
+    /// declared addresses involved in this thread; empty (omitted) unless the
+    /// tenant has 2+ addresses configured
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    accts: Vec<String>,
 }
 
 #[derive(Serialize, Clone)]
 struct Facets {
     labels: Vec<(String, u64)>,
+    #[serde(default)]
+    addresses: Vec<(String, u64)>,
     min_ts: i64,
     max_ts: i64,
     total: u64,
@@ -108,7 +117,7 @@ struct Facets {
 
 impl Default for Facets {
     fn default() -> Self {
-        Facets { labels: Vec::new(), min_ts: 0, max_ts: 0, total: 0 }
+        Facets { labels: Vec::new(), addresses: Vec::new(), min_ts: 0, max_ts: 0, total: 0 }
     }
 }
 
@@ -121,6 +130,7 @@ struct FilterParams {
     after: Option<String>,
     before: Option<String>,
     attachment: Option<String>,
+    acct: Option<String>,
     body: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
@@ -192,7 +202,94 @@ fn metadata_for(inner: &AppStateInner, idx: usize) -> EmailMetadata {
     }
 }
 
-fn thread_out(t: &Thread, matched: usize) -> ThreadOut {
+/// Identity tagging: which *declared* addresses involve this message.
+/// Tags are derived at read time from index fields that already exist
+/// (from/to/cc) — nothing is stored, so editing the list relabels the
+/// whole archive instantly and merges/rescans are unaffected.
+
+/// `hajni+work` -> `hajni` (plus-tags are alias decorations, not new bases)
+fn addr_base(local: &str) -> &str {
+    match local.find('+') {
+        Some(i) => &local[..i],
+        None => local,
+    }
+}
+
+/// Match a raw header address against the declared list.
+/// Exact declaration wins over its plus-base (so a separately declared
+/// `hajni+work@…` keeps its own tag); `+variants` collapse into the base.
+fn addr_tag(raw: &str, declared: &[String]) -> Option<String> {
+    let lower = raw.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if let Some(d) = declared.iter().find(|d| d.as_str() == lower) {
+        return Some(d.clone());
+    }
+    let (local, domain) = lower.split_once('@')?;
+    let base = format!("{}@{}", addr_base(local), domain);
+    declared.iter().find(|d| d.as_str() == base).cloned()
+}
+
+/// Declared addresses this message involves, in declaration order.
+/// Off entirely below 2 addresses: one identity tells you nothing.
+fn entry_tags(e: &MailEntry, declared: &[String]) -> Vec<String> {
+    if declared.len() < 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut consider = |addr: &str| {
+        if let Some(t) = addr_tag(addr, declared) {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    };
+    consider(&e.from.address);
+    for a in &e.to {
+        consider(&a.address);
+    }
+    for a in &e.cc {
+        consider(&a.address);
+    }
+    out
+}
+
+fn address_counts(entries: &[MailEntry], declared: &[String]) -> Vec<(String, u64)> {
+    if declared.len() < 2 {
+        return Vec::new();
+    }
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for e in entries {
+        for t in entry_tags(e, declared) {
+            *counts.entry(t).or_insert(0) += 1;
+        }
+    }
+    // declaration order, then by count — stable UI
+    let mut out: Vec<(String, u64)> = declared
+        .iter()
+        .map(|d| (d.clone(), counts.get(d).copied().unwrap_or(0)))
+        .filter(|(_, c)| *c > 0)
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
+fn thread_out(t: &Thread, matched: usize, entries: &[MailEntry], declared: &[String]) -> ThreadOut {
+    // union of message tags, in declaration order (stable row badges)
+    let mut accts: Vec<String> = Vec::new();
+    if declared.len() >= 2 {
+        for &i in &t.msgs {
+            for tag in entry_tags(&entries[i], declared) {
+                if !accts.contains(&tag) {
+                    accts.push(tag);
+                }
+            }
+        }
+        accts.sort_unstable_by(|a, b| {
+            declared.iter().position(|d| d == a).cmp(&declared.iter().position(|d| d == b))
+        });
+    }
     ThreadOut {
         tid: t.tid.clone(),
         subject: t.subject.clone(),
@@ -201,6 +298,7 @@ fn thread_out(t: &Thread, matched: usize) -> ThreadOut {
         count: t.msgs.len(),
         matched,
         attachments: t.attachments,
+        accts,
     }
 }
 
@@ -372,6 +470,7 @@ struct Sel {
     cat: Option<String>,
     status: Option<String>,
     other: Vec<String>,
+    addrs: Vec<String>,
 }
 
 fn parse_sel(p: &FilterParams) -> Sel {
@@ -379,6 +478,11 @@ fn parse_sel(p: &FilterParams) -> Sel {
         cat: p.cat.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
         status: p.status.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
         other: csv_labels(&p.other),
+        addrs: p
+            .acct
+            .as_deref()
+            .map(|v| v.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default(),
     }
 }
 
@@ -412,7 +516,9 @@ fn group_of(l: &str) -> u8 {
 
 /// Whether the entry satisfies the selection, optionally skipping one group
 /// (for per-group facet counts). 0=category, 1=status, 2=other; `other` values OR.
-fn sel_ok(e: &MailEntry, s: &Sel, skip: u8) -> bool {
+/// `skip` names the group whose own selection is ignored (per-group facet
+/// counting); pass 9 from real filtering paths, which honor every group.
+fn sel_ok(e: &MailEntry, s: &Sel, skip: u8, declared: &[String]) -> bool {
     if skip != 0 {
         if let Some(l) = &s.cat {
             if !has_lbl(e, l) {
@@ -429,6 +535,12 @@ fn sel_ok(e: &MailEntry, s: &Sel, skip: u8) -> bool {
     }
     if skip != 2 && !s.other.is_empty() && !s.other.iter().any(|l| has_lbl(e, l)) {
         return false;
+    }
+    if skip != 3 && !s.addrs.is_empty() {
+        let tags = entry_tags(e, declared);
+        if !s.addrs.iter().any(|a| tags.iter().any(|t| t.eq_ignore_ascii_case(a))) {
+            return false;
+        }
     }
     true
 }
@@ -527,6 +639,7 @@ fn compute_facets(entries: &[MailEntry]) -> Facets {
     labels.truncate(200);
     Facets {
         labels,
+        addresses: Vec::new(), // filled by the scan handler from the declared list
         min_ts: min.map(|d| d.timestamp_millis()).unwrap_or(0),
         max_ts: max.map(|d| d.timestamp_millis()).unwrap_or(0),
         total: entries.len() as u64,
@@ -637,13 +750,14 @@ fn seed_tenant(
     archive_root: &std::path::Path,
     backup_root: &std::path::Path,
 ) -> Tenant {
-    let epoch = auth::read_profile(profiles_dir, slug)
-        .map(|sp| auth::secret_fingerprint(&sp.secret))
+    let (epoch, addresses) = auth::read_profile(profiles_dir, slug)
+        .map(|sp| (auth::secret_fingerprint(&sp.secret), sp.addresses))
         .unwrap_or_default();
     Tenant {
         slug: slug.to_string(),
         name: name.to_string(),
         epoch: Arc::new(RwLock::new(epoch)),
+        addresses: Arc::new(RwLock::new(addresses.into_iter().map(|a| a.to_lowercase()).collect())),
         inner: Arc::new(RwLock::new(AppStateInner::default())),
         data_dir: data_root.join(slug),
         archive_dir: archive_root.join(slug),
@@ -661,6 +775,7 @@ fn build_app(root: Root) -> Router {
         .route("/api/profile", get(profile_info))
         .route("/api/profile/password", post(change_password))
         .route("/api/profile/name", post(change_name))
+        .route("/api/profile/addresses", post(change_addresses))
         .route("/api/profile/portrait", post(upload_portrait).delete(delete_portrait))
         .route("/api/scan", post(scan_handler))
         .route("/api/merge", post(merge_handler))
@@ -869,7 +984,9 @@ async fn scan_handler(Extension(state): Extension<Tenant>) -> Json<ScanResponse>
         info!("Indexing: {:?}", target_path);
         match builder::build_index(&target_path, false, None) {
             Ok(entries) => {
-                let facets = compute_facets(&entries);
+                let declared = state.addresses.read().unwrap().clone();
+                let mut facets = compute_facets(&entries);
+                facets.addresses = address_counts(&entries, &declared);
                 let (threads, thread_order, tmap) = build_threads(&entries);
                 let mut order: Vec<usize> = (0..entries.len()).collect();
                 order.sort_by(|&a, &b| entries[b].date.cmp(&entries[a].date));
@@ -899,6 +1016,7 @@ async fn filters_handler(
     Query(params): Query<FilterParams>,
 ) -> Json<Facets> {
     let inner = state.inner.clone();
+    let declared = state.addresses.read().unwrap().clone();
     let fallback = state.inner.read().unwrap().facets.clone();
     let facets = tokio::task::spawn_blocking(move || {
         let lock = inner.read().unwrap();
@@ -910,6 +1028,7 @@ async fn filters_handler(
         let any = s.cat.is_some()
             || s.status.is_some()
             || !s.other.is_empty()
+            || !s.addrs.is_empty()
             || after.is_some()
             || before.is_some()
             || att;
@@ -919,13 +1038,15 @@ async fn filters_handler(
         // Per-group facet counts: each group's labels are counted under all
         // *other* active filters, so a selection never zeroes its own group.
         let mut counts: HashMap<String, u64> = HashMap::new();
+        let mut addr_counts: HashMap<String, u64> = HashMap::new();
         for e in &lock.entries {
             if !date_att_ok(e, &after, &before, att) {
                 continue;
             }
-            let a = sel_ok(e, &s, 0);
-            let b = sel_ok(e, &s, 1);
-            let c = sel_ok(e, &s, 2);
+            let a = sel_ok(e, &s, 0, &declared);
+            let b = sel_ok(e, &s, 1, &declared);
+            let c = sel_ok(e, &s, 2, &declared);
+            let d = sel_ok(e, &s, 3, &declared);
             for l in &e.labels {
                 // A label is counted under every filter except its own group's.
                 let inc = match group_of(l) {
@@ -937,12 +1058,22 @@ async fn filters_handler(
                     *counts.entry(l.clone()).or_insert(0) += 1;
                 }
             }
+            if d {
+                for t in entry_tags(e, &declared) {
+                    *addr_counts.entry(t).or_insert(0) += 1;
+                }
+            }
         }
         let mut labels: Vec<(String, u64)> = counts.into_iter().collect();
         labels.sort_unstable_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
         labels.truncate(200);
+        let addresses: Vec<(String, u64)> = declared
+            .iter()
+            .filter_map(|d| addr_counts.get(d).map(|c| (d.clone(), *c)).filter(|(_, c)| *c > 0))
+            .collect();
         Facets {
             labels,
+            addresses,
             min_ts: base.min_ts,
             max_ts: base.max_ts,
             total: base.total,
@@ -959,6 +1090,7 @@ async fn list_messages(
     Query(params): Query<FilterParams>,
 ) -> Json<Vec<ThreadOut>> {
     let inner = state.inner.clone();
+    let declared = state.addresses.read().unwrap().clone();
     let items = tokio::task::spawn_blocking(move || {
         let lock = inner.read().unwrap();
         let offset = params.offset.unwrap_or(0);
@@ -970,6 +1102,7 @@ async fn list_messages(
         let filtered = s.cat.is_some()
             || s.status.is_some()
             || !s.other.is_empty()
+            || !s.addrs.is_empty()
             || after.is_some()
             || before.is_some()
             || want_att;
@@ -979,7 +1112,7 @@ async fn list_messages(
                 Some(slice) => slice
                     .iter()
                     .take(limit)
-                    .map(|&ti| thread_out(&lock.threads[ti], 0))
+                    .map(|&ti| thread_out(&lock.threads[ti], 0, &lock.entries, &declared))
                     .collect(),
                 None => Vec::new(),
             };
@@ -992,7 +1125,7 @@ async fn list_messages(
             let pass = (!want_att || t.attachments)
                 && t.msgs
                     .iter()
-                    .any(|&i| sel_ok(&lock.entries[i], &s, 3) && date_att_ok(&lock.entries[i], &after, &before, false));
+                    .any(|&i| sel_ok(&lock.entries[i], &s, 9, &declared) && date_att_ok(&lock.entries[i], &after, &before, false));
             if !pass {
                 continue;
             }
@@ -1003,7 +1136,7 @@ async fn list_messages(
             if out.len() >= limit {
                 break;
             }
-            out.push(thread_out(t, 0));
+            out.push(thread_out(t, 0, &lock.entries, &declared));
         }
         out
     })
@@ -1046,6 +1179,7 @@ async fn search_handler(
     Query(params): Query<FilterParams>,
 ) -> Json<Vec<ThreadOut>> {
     let inner = state.inner.clone();
+    let declared = state.addresses.read().unwrap().clone();
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let q = compose_query(&params);
@@ -1084,12 +1218,27 @@ async fn search_handler(
                     }
                 }
                 tids.sort_by(|&a, &b| lock.threads[b].date.cmp(&lock.threads[a].date));
+                // identity tags are not part of the archive's own vocabulary,
+                // so an account filter narrows results here, after the query
+                let s = parse_sel(&params);
+                let tids: Vec<usize> = if s.addrs.is_empty() {
+                    tids
+                } else {
+                    tids.into_iter()
+                        .filter(|&ti| {
+                            lock.threads[ti].msgs.iter().any(|&i| {
+                                let tags = entry_tags(&lock.entries[i], &declared);
+                                s.addrs.iter().any(|a| tags.iter().any(|t| t.eq_ignore_ascii_case(a)))
+                            })
+                        })
+                        .collect()
+                };
                 tids.iter()
                     .skip(offset)
                     .take(limit)
                     .map(|&ti| {
                         let t = &lock.threads[ti];
-                        thread_out(t, counts.get(&t.tid).copied().unwrap_or(0))
+                        thread_out(t, counts.get(&t.tid).copied().unwrap_or(0), &lock.entries, &declared)
                     })
                     .collect()
             }
@@ -1252,6 +1401,83 @@ async fn get_attachment_data(
             (headers, bytes).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Attachment not found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod address_tests {
+    use super::*;
+
+    fn declared() -> Vec<String> {
+        vec!["hajni@gmail.com".into(), "hajni+work@gmail.com".into(), "hajni@outlook.com".into()]
+    }
+
+    fn mail(from: &str, to: &[&str], cc: &[&str]) -> MailEntry {
+        let addr = |s: &str| mboxshell::model::address::EmailAddress {
+            display_name: String::new(),
+            address: s.to_string(),
+        };
+        MailEntry {
+            offset: 0,
+            length: 0,
+            date: Utc::now(),
+            from: addr(from),
+            to: to.iter().map(|a| addr(a)).collect(),
+            cc: cc.iter().map(|a| addr(a)).collect(),
+            subject: String::new(),
+            message_id: String::new(),
+            in_reply_to: None,
+            references: Vec::new(),
+            has_attachments: false,
+            content_type: String::new(),
+            text_size: 0,
+            labels: Vec::new(),
+            thread_id: None,
+            sequence: 0,
+        }
+    }
+
+    #[test]
+    fn tag_exact_specific_and_plus_collapsing() {
+        let d = declared();
+        // exact wins over plus-base when declared explicitly
+        assert_eq!(addr_tag("hajni+work@gmail.com", &d).as_deref(), Some("hajni+work@gmail.com"));
+        // undeclared plus variant collapses to the base tag
+        assert_eq!(addr_tag("Hajni+News@Gmail.com", &d).as_deref(), Some("hajni@gmail.com"));
+        // case-insensitive exact
+        assert_eq!(addr_tag("HAJNI@OUTLOOK.COM", &d).as_deref(), Some("hajni@outlook.com"));
+        // strangers
+        assert_eq!(addr_tag("someone@else.org", &d), None);
+        assert_eq!(addr_tag("", &d), None);
+    }
+
+    #[test]
+    fn entry_tags_gate_below_two_and_dedupe() {
+        let one = vec!["hajni@gmail.com".to_string()];
+        let e = mail("x@y.z", &["hajni@gmail.com"], &[]);
+        assert!(entry_tags(&e, &one).is_empty(), "single identity tells you nothing");
+        let d = declared();
+        let e2 = mail("hajni+work@gmail.com", &["hajni@outlook.com", "friend@a.nl"], &["hajni+misc@gmail.com"]);
+        assert_eq!(entry_tags(&e2, &d), vec![
+            "hajni+work@gmail.com".to_string(),
+            "hajni@outlook.com".to_string(),
+            "hajni@gmail.com".to_string(),
+        ], "declaration order, deduped");
+    }
+
+    #[test]
+    fn address_counts_zeroes_absent_and_orders_by_count() {
+        let d = declared();
+        let entries = vec![
+            mail("a@b.c", &["hajni@gmail.com", "hajni+work@gmail.com"], &[]),
+            mail("a@b.c", &["hajni@gmail.com"], &[]),
+            mail("a@b.c", &["hajni@gmail.com"], &[]),
+        ];
+        assert_eq!(address_counts(&entries, &d), vec![
+            ("hajni@gmail.com".to_string(), 3u64),
+            ("hajni+work@gmail.com".to_string(), 1),
+        ], "counted tags only, count desc, ties in declaration order");
+        assert!(address_counts(&entries, &["solo@x.y".to_string()]).is_empty());
     }
 }
 
@@ -1490,7 +1716,7 @@ async fn login_handler(
     // we already have verified. Worst case it logs and keeps the old hash.
     let final_secret = if auth::is_legacy(&stored.secret) {
         let upgraded = auth::hash_password(&body.password);
-        match auth::write_profile(&root.profiles_dir, &body.slug, &stored.name, &upgraded) {
+        match auth::write_profile_full(&root.profiles_dir, &body.slug, &stored.name, &upgraded, &stored.addresses) {
             Ok(()) => {
                 info!("upgraded '{}' secret to bcrypt", body.slug);
                 upgraded
@@ -1606,7 +1832,7 @@ async fn change_password(
         ));
     }
     let new_hash = auth::hash_password(&b.new);
-    auth::write_profile(&root.profiles_dir, &t.slug, &stored.name, &new_hash)
+    auth::write_profile_full(&root.profiles_dir, &t.slug, &stored.name, &new_hash, &stored.addresses)
         .map_err(|e| server_err(format!("could not save: {}", e)))?;
     // Revokes every session signed under the old secret...
     let fp = auth::secret_fingerprint(&new_hash);
@@ -1646,7 +1872,7 @@ async fn change_name(
     let stored = auth::read_profile(&root.profiles_dir, &t.slug).ok_or_else(|| {
         bad(StatusCode::NOT_FOUND, "profile file is missing")
     })?;
-    auth::write_profile(&root.profiles_dir, &t.slug, name, &stored.secret).map_err(|e| {
+    auth::write_profile_full(&root.profiles_dir, &t.slug, name, &stored.secret, &stored.addresses).map_err(|e| {
         bad(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("could not save: {}", e),
@@ -1654,6 +1880,47 @@ async fn change_name(
     })?;
     info!("display name set to '{}' for '{}'", name, t.slug);
     Ok(Json(serde_json::json!({ "ok": true, "name": name })))
+}
+
+#[derive(Deserialize)]
+struct AddressesIn {
+    addresses: Vec<String>,
+}
+
+/// Declared identities (accounts & aliases). Saved to the profile but also
+/// applied live: tags and counts derive from in-memory entries, so changing
+/// the list relabels the entire archive without a rescan.
+async fn change_addresses(
+    State(root): State<Root>,
+    Extension(t): Extension<Tenant>,
+    Json(b): Json<AddressesIn>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let bad = |code: StatusCode, msg: String| (code, Json(serde_json::json!({ "error": msg })));
+    let mut cleaned: Vec<String> = Vec::new();
+    for raw in b.addresses {
+        let s = raw.trim().to_lowercase();
+        if s.is_empty() || s.contains(' ') || !s.contains('@') || s.len() > 254 {
+            return Err(bad(StatusCode::BAD_REQUEST, format!("'{}' is not an email address", raw.trim())));
+        }
+        if !cleaned.contains(&s) {
+            cleaned.push(s);
+        }
+    }
+    if cleaned.len() > 30 {
+        return Err(bad(StatusCode::BAD_REQUEST, "at most 30 addresses".to_string()));
+    }
+    let stored = auth::read_profile(&root.profiles_dir, &t.slug)
+        .ok_or_else(|| bad(StatusCode::NOT_FOUND, "profile file is missing".to_string()))?;
+    auth::write_profile_full(&root.profiles_dir, &t.slug, &stored.name, &stored.secret, &cleaned)
+        .map_err(|e| bad(StatusCode::INTERNAL_SERVER_ERROR, format!("could not save: {}", e)))?;
+    *t.addresses.write().unwrap() = cleaned.clone();
+    let counts = {
+        let lock = t.inner.read().unwrap();
+        address_counts(&lock.entries, &cleaned)
+    };
+    t.inner.write().unwrap().facets.addresses = counts;
+    info!("{} addresses set for '{}'", cleaned.len(), t.slug);
+    Ok(Json(serde_json::json!({ "ok": true, "addresses": cleaned })))
 }
 
 #[derive(Deserialize)]
@@ -1717,6 +1984,7 @@ async fn profile_info(
         "slug": t.slug,
         "name": display_name(&root, &t),
         "has_portrait": auth::find_portrait(&root.profiles_dir, &t.slug).is_some(),
+        "addresses": t.addresses.read().unwrap().clone(),
     }))
 }
 
@@ -2043,6 +2311,11 @@ mod integration_tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(file), content).unwrap();
         }
+        fn add_with_addresses(&self, slug: &str, name: &str, password: &str, addresses: &[String]) {
+            self.add(slug, name, password);
+            let sp = auth::read_profile(&self.profiles, slug).unwrap();
+            auth::write_profile_full(&self.profiles, slug, name, &sp.secret, addresses).unwrap();
+        }
     }
 
     /// A two-message thread (reply chains to q1) plus, in a second file, a
@@ -2247,5 +2520,98 @@ Same message id, corrected body text here.
         assert_eq!(list[0]["subject"], "Lunch plans");
         let r = threads(&app, &h, "/api/search?q=quarterly").await;
         assert_eq!(r.as_array().unwrap().len(), 0, "another tenant's mail never leaks into search");
+    }
+
+    #[tokio::test]
+    async fn addresses_tag_filter_and_edit_live() {
+        let env = Env::new("addrs");
+        env.add_with_addresses("daniel", "Daniel", "daniel", &[
+            "me@example.com".into(),
+            "dave@example.com".into(),
+        ]);
+        env.mail("daniel", "full.mbox", &format!("{THREAD_MBOX}\n{LUNCH_MBOX}"));
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+        scan(&app, &cookie).await;
+        wait_indexed(&app, &cookie, 3).await;
+
+        let list = threads(&app, &cookie, "/api/messages").await;
+        let accts = list[0]["accts"].as_array().unwrap();
+        assert_eq!(accts.len(), 2, "every fixture thread involves both declared identities");
+        assert_eq!(accts[0], "me@example.com", "declaration order");
+        let (_, fac) = get_json(&app, "/api/filters", Some(&cookie)).await;
+        let counts = fac["addresses"].as_array().unwrap();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0][1], 3, "me@example.com in all three messages");
+
+        let both = threads(&app, &cookie, "/api/messages?acct=dave@example.com").await;
+        assert_eq!(both.as_array().unwrap().len(), 2);
+        let none = threads(&app, &cookie, "/api/messages?acct=zz@zz.zz").await;
+        assert_eq!(none.as_array().unwrap().len(), 0);
+        let s = threads(&app, &cookie, "/api/search?q=quarterly&acct=me@example.com").await;
+        assert_eq!(s.as_array().unwrap().len(), 1);
+        let s2 = threads(&app, &cookie, "/api/search?q=quarterly&acct=zz@zz.zz").await;
+        assert_eq!(s2.as_array().unwrap().len(), 0);
+
+        // live edit: lowercased, deduped, applied without rescan, epoch intact
+        let r = send(
+            &app,
+            req(
+                "POST",
+                "/api/profile/addresses",
+                Body::from(
+                    json!({ "addresses": ["  Hajni@Gmail.com ", "hajni+work@gmail.com", "hajni@gmail.com"] })
+                        .to_string(),
+                ),
+                Some(&cookie),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = json_of(r).await;
+        assert_eq!(
+            body["addresses"],
+            json!(["hajni@gmail.com", "hajni+work@gmail.com"])
+        );
+        let (st, _) = get_json(&app, "/api/whoami", Some(&cookie)).await;
+        assert_eq!(st, StatusCode::OK, "address edit must not revoke sessions");
+        let (_, prof) = get_json(&app, "/api/profile", Some(&cookie)).await;
+        assert_eq!(prof["addresses"].as_array().unwrap().len(), 2);
+
+        let list2 = threads(&app, &cookie, "/api/messages").await;
+        assert!(list2[0].get("accts").is_none(), "no involved identity -> tag omitted, no rescan");
+        let (_, fac2) = get_json(&app, "/api/filters", Some(&cookie)).await;
+        assert_eq!(fac2["addresses"].as_array().unwrap().len(), 0);
+
+        let bad = send(
+            &app,
+            req(
+                "POST",
+                "/api/profile/addresses",
+                Body::from(json!({ "addresses": ["nope"] }).to_string()),
+                Some(&cookie),
+                true,
+            ),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let after = fs::read_to_string(env.profiles.join("daniel").join("profile.json")).unwrap();
+        assert!(after.contains("hajni+work@gmail.com"), "rejected edit changed nothing");
+    }
+
+    #[tokio::test]
+    async fn single_declared_address_stays_invisible() {
+        let env = Env::new("oneaddr");
+        env.add_with_addresses("daniel", "Daniel", "daniel", &["me@example.com".into()]);
+        env.mail("daniel", "export.mbox", THREAD_MBOX);
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+        scan(&app, &cookie).await;
+        wait_indexed(&app, &cookie, 2).await;
+        let list = threads(&app, &cookie, "/api/messages").await;
+        assert!(list[0].get("accts").is_none(), "one identity is not a distinction");
+        let (_, fac) = get_json(&app, "/api/filters", Some(&cookie)).await;
+        assert_eq!(fac["addresses"].as_array().unwrap().len(), 0);
     }
 }

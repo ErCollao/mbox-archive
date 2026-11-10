@@ -11,6 +11,11 @@
     let displayName = "";
     let savingName = false;
 
+    // addresses form
+    let addresses = [];
+    let newAddr = "";
+    let savingAddr = false;
+
     // password form
     let cur = "", next = "", again = "";
     let saving = false;
@@ -20,6 +25,7 @@
         if (res.status === 401) { window.location.href = '/welcome'; return; }
         me = await res.json();
         displayName = me.name;
+        addresses = me.addresses ?? [];
         bust = Date.now();
     }
     onMount(load);
@@ -89,6 +95,31 @@
         }
     }
 
+    async function saveAddresses(next) {
+        err = note = "";
+        savingAddr = true;
+        try {
+            const res = await fetch('/api/profile/addresses', {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ addresses: next })
+            });
+            const out = await res.json();
+            if (!res.ok) return flash(out.error || "Could not save addresses.", true);
+            addresses = out.addresses;
+            flash("Addresses updated — tags apply immediately, no rescan needed.");
+        } finally {
+            savingAddr = false;
+        }
+    }
+
+    function addAddress() {
+        const a = newAddr.trim().toLowerCase();
+        newAddr = "";
+        if (!a || addresses.includes(a)) return;
+        saveAddresses([...addresses, a]);
+    }
+
     async function changePassword() {
         err = note = "";
         if (next !== again) return flash("The two new passwords don't match.", true);
@@ -147,6 +178,35 @@
                 disabled={savingName || !displayName.trim() || displayName.trim() === me.name}
             >
                 {savingName ? "Saving…" : "Save name"}
+            </button>
+        </section>
+
+        <section>
+            <h2>Addresses</h2>
+            <p class="hint">Your own accounts and forwarding aliases. List 2 or more and every message that involves one gets a tag you can filter by — sent, received, or aliased.</p>
+            {#if addresses.length}
+                <div class="addr-list">
+                    {#each addresses as a (a)}
+                        <span class="addr-chip">
+                            {a}
+                            <button aria-label={"Remove " + a} disabled={savingAddr} on:click={() => saveAddresses(addresses.filter(x => x !== a))}>×</button>
+                        </span>
+                    {/each}
+                </div>
+            {:else}
+                <p class="hint">None set — a single identity is never tagged.</p>
+            {/if}
+            <div class="fields">
+                <input
+                    type="text"
+                    bind:value={newAddr}
+                    placeholder="name@example.com"
+                    maxlength="254"
+                    on:keydown={(e) => e.key === 'Enter' && addAddress()}
+                />
+            </div>
+            <button class="btn" on:click={addAddress} disabled={savingAddr || !newAddr.trim()}>
+                {savingAddr ? "Saving…" : "Add address"}
             </button>
         </section>
 
@@ -261,4 +321,13 @@
         font-size: .95rem; font-family: inherit; color: #202124; background: white;
     }
     .fields input:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,.16); }
+    .addr-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.6rem; }
+    .addr-chip {
+        display: inline-flex; align-items: center; gap: 0.3rem;
+        padding: 0.15rem 0.5rem; border-radius: 12px;
+        border: 1px solid #d3e3fd; background: #f6faff; color: #1c3aa9;
+        font-size: 0.78rem;
+    }
+    .addr-chip button { border: none; background: transparent; color: #80868b; cursor: pointer; font-size: 0.9rem; padding: 0 0.1rem; }
+    .addr-chip button:hover { color: #d93025; }
 </style>

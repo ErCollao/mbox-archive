@@ -16,6 +16,10 @@ pub struct StoredProfile {
     pub name: String,
     /// bcrypt hash ("$2...") or legacy lowercase hex sha256
     pub secret: String,
+    /// declared identities (accounts & forwarding aliases) for multi-account
+    /// archives; absent in older files, which default to empty
+    #[serde(default)]
+    pub addresses: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -223,14 +227,37 @@ pub fn hash_password(password: &str) -> String {
     bcrypt::hash(password, 10).expect("bcrypt hashing failed")
 }
 
+/// Test-side convenience wrapper over the full writer.
+#[cfg(test)]
 pub fn write_profile(dir: &std::path::Path, slug: &str, name: &str, secret: &str) -> std::io::Result<()> {
+    write_profile_full(dir, slug, name, secret, &[])
+}
+
+/// Full-form writer: every mutation of a profile must pass the current
+/// `addresses` through, or editing the name would silently erase them.
+pub fn write_profile_full(
+    dir: &std::path::Path,
+    slug: &str,
+    name: &str,
+    secret: &str,
+    addresses: &[String],
+) -> std::io::Result<()> {
     let target = dir.join(slug).join("profile.json");
     let tmp = dir.join(slug).join("profile.json.tmp");
-    let body = format!(
-        "{{\n  \"name\": {},\n  \"secret\": \"{}\"\n}}\n",
-        serde_json::to_string(name).unwrap(),
-        secret
-    );
+    let body = if addresses.is_empty() {
+        format!(
+            "{{\n  \"name\": {},\n  \"secret\": \"{}\"\n}}\n",
+            serde_json::to_string(name).unwrap(),
+            secret
+        )
+    } else {
+        format!(
+            "{{\n  \"name\": {},\n  \"secret\": \"{}\",\n  \"addresses\": {}\n}}\n",
+            serde_json::to_string(name).unwrap(),
+            secret,
+            serde_json::to_string(addresses).unwrap()
+        )
+    };
     fs::write(&tmp, body)?;
     #[cfg(unix)]
     {
@@ -395,6 +422,28 @@ mod tests {
         // unicode names survive the round-trip
         write_profile(&d, "hajni", "Hajni Хайникова", "x").unwrap();
         assert_eq!(read_profile(&d, "hajni").unwrap().name, "Hajni Хайникова");
+        fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn addresses_roundtrip_and_preservation() {
+        let d = tmpdir("addr");
+        fs::create_dir_all(d.join("hajni")).unwrap();
+        // legacy file without the field: defaults to empty
+        fs::write(d.join("hajni").join("profile.json"), r#"{"name":"H","secret":"s"}"#).unwrap();
+        assert_eq!(read_profile(&d, "hajni").unwrap().addresses, Vec::<String>::new());
+        // full-form writer stores addresses
+        let addrs = ["hajni@gmail.com".to_string(), "hajni+work@gmail.com".to_string()];
+        write_profile_full(&d, "hajni", "H", "s", &addrs).unwrap();
+        assert_eq!(read_profile(&d, "hajni").unwrap().addresses, addrs);
+        // a name-only edit through the full writer must carry them along
+        write_profile_full(&d, "hajni", "Hajni II", "s", &read_profile(&d, "hajni").unwrap().addresses).unwrap();
+        let sp = read_profile(&d, "hajni").unwrap();
+        assert_eq!(sp.name, "Hajni II");
+        assert_eq!(sp.addresses, addrs);
+        // unicode + addresses together
+        write_profile_full(&d, "hajni", "Хайни", "s", &addrs).unwrap();
+        assert_eq!(read_profile(&d, "hajni").unwrap().addresses.len(), 2);
         fs::remove_dir_all(&d).ok();
     }
 

@@ -8,6 +8,8 @@
     let hasAttachments = false;
     let sel = { cat: null, status: null };
     let selOther = [];
+    let selAcct = [];
+    let acctFacets = [];
     let showAllLabels = false;
     let labels = [];
     let facetMin = 0;
@@ -414,13 +416,21 @@
         applyFilters();
     }
 
+    function pickAcct(addr) {
+        selAcct = selAcct.includes(addr)
+            ? selAcct.filter(a => a !== addr)
+            : [...selAcct, addr];
+        drawerOpen = false;
+        applyFilters();
+    }
+
     function fieldFor(name) {
         for (const [k, v] of Object.entries(sel)) if (v === name) return k;
         return null;
     }
 
     function anyFilter() {
-        return activeLabels().length > 0 || afterTs !== null || beforeTs !== null || hasAttachments;
+        return activeLabels().length > 0 || selAcct.length > 0 || afterTs !== null || beforeTs !== null || hasAttachments;
     }
 
     function facetParams() {
@@ -431,12 +441,15 @@
         if (afterTs !== null) p.set("after", isoDate(afterTs));
         if (beforeTs !== null) p.set("before", isoDate(beforeTs));
         if (hasAttachments) p.set("attachment", "1");
+
+        if (selAcct.length) p.set("acct", selAcct.join(","));
         return p;
     }
 
     $: chipList = [
         ...activeLabels().map(n => ({ kind: "label", n })),
         ...(hasAttachments ? [{ kind: "att", n: "" }] : []),
+        ...selAcct.map(a => ({ kind: "acct", n: a })),
         ...(afterTs !== null || beforeTs !== null ? [{ kind: "date", n: "" }] : [])
     ];
 
@@ -456,6 +469,8 @@
             }
         } else if (c.kind === "att") {
             hasAttachments = false;
+        } else if (c.kind === "acct") {
+            selAcct = selAcct.filter(a => a !== c.n);
         } else {
             sliderLo = 0;
             sliderHi = totalDays();
@@ -503,6 +518,7 @@
     function clearFilters() {
         sel = { cat: null, status: null };
         selOther = [];
+        selAcct = [];
         showAllLabels = false;
         afterTs = null;
         beforeTs = null;
@@ -521,6 +537,7 @@
             const res = await fetch(`${API_URL}/filters`);
             const f = await res.json();
             labels = f.labels;
+            acctFacets = f.addresses ?? [];
             facetMin = f.min_ts;
             facetMax = f.max_ts;
             sliderLo = 0;
@@ -751,7 +768,7 @@
             {/if}
         </div>
 
-        {#if labels.length > 0}
+        {#if labels.length > 0 || acctFacets.length > 1}
             <div class="labels">
                 {#each groups as g (g.field)}
                     <div class="label-group">
@@ -812,6 +829,22 @@
                         {/if}
                     </div>
                 {/each}
+                {#if acctFacets.length > 1}
+                    <div class="label-group">
+                        <div class="nav-head">Addresses</div>
+                        {#each acctFacets as [addr, count] (addr)}
+                            <button
+                                class="label-item"
+                                class:on={selAcct.includes(addr)}
+                                title="Threads involving {addr}"
+                                on:click={() => pickAcct(addr)}
+                            >
+                                <span class="lname">{addr}</span>
+                                <span class="count">{fmtCount(count)}</span>
+                            </button>
+                        {/each}
+                    </div>
+                {/if}
             </div>
         {/if}
     </aside>
@@ -848,7 +881,7 @@
                     {/if}
                     {#each chipList as c (c.kind + c.n)}
                         <button class="af-chip" title="Remove filter" on:click={() => removeChip(c)}>
-                            {c.kind === 'label' ? dispFor(c.n) : c.kind === 'att' ? 'Has attachments' : dateRangeText()} ×
+                            {c.kind === 'label' ? dispFor(c.n) : c.kind === 'att' ? 'Has attachments' : c.kind === 'acct' ? c.n : dateRangeText()} ×
                         </button>
                     {/each}
                 </span>
@@ -884,6 +917,9 @@
                         <div class="meta">
                             <span class="from" title={t.from}>{t.from}</span>
                             <span class="date">{fmtDate(t.date)}</span>
+                            {#each t.accts ?? [] as a (a)}
+                                <span class="acct-tag" title="Involves this address">{a}</span>
+                            {/each}
                         </div>
                     </div>
                 {/each}
@@ -1531,6 +1567,16 @@
         font-size: 0.8rem;
         margin-right: 0.35rem;
         opacity: 0.75;
+    }
+    .acct-tag {
+        flex-shrink: 0;
+        padding: 0 0.4rem;
+        border-radius: 8px;
+        border: 1px solid #d3e3fd;
+        color: #1c3aa9;
+        background: #fff;
+        font-size: 0.66rem;
+        white-space: nowrap;
     }
     .badge {
         display: inline-block;
