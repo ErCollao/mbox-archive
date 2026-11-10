@@ -432,9 +432,11 @@
         return null;
     }
 
-    function anyFilter() {
-        return activeLabels().length > 0 || selAcct.length > 0 || afterTs !== null || beforeTs !== null || hasAttachments;
-    }
+    // reactive derived, not a function: the compiler cannot see through
+    // function calls in templates, which left the old anyFilter() call sites
+    // stale (Clear button refused to appear)
+    $: anyFilter = sel.cat !== null || sel.status !== null || selOther.length > 0
+        || selAcct.length > 0 || afterTs !== null || beforeTs !== null || hasAttachments;
 
     function facetParams() {
         const p = new URLSearchParams();
@@ -766,7 +768,7 @@
                 <input type="checkbox" bind:checked={hasAttachments} on:change={applyFilters} />
                 Has attachments
             </label>
-            {#if anyFilter() || query}
+            {#if anyFilter || query}
                 <button class="clear" on:click={clearFilters}>Clear</button>
             {/if}
         </div>

@@ -23,7 +23,7 @@ function stubHome({ addresses = [] } = {}) {
         const u = String(url);
         calls.push(u);
         if (u.startsWith('/api/whoami')) return Promise.resolve(res({ slug: 'd', name: 'D' }));
-        if (u.startsWith('/api/filters')) return Promise.resolve(res({ labels: [['Category Personal', 5], ['Inbox', 3]], addresses: addresses.map((a, i) => [a, 10 - i]), min_ts: 0, max_ts: 86400000 * 40, total: 2 }));
+        if (u.startsWith('/api/filters')) return Promise.resolve(res({ labels: [['Category Social', 4], ['Inbox', 3]], addresses: addresses.map((a, i) => [a, 10 - i]), min_ts: 0, max_ts: 86400000 * 40, total: 2 }));
         if (u.startsWith('/api/messages')) return Promise.resolve(res(rows));
         if (u.startsWith('/api/thread')) return Promise.resolve(res({ tid: 't1', subject: 'First', messages: [] }));
         if (/meta/.test(u)) return Promise.resolve(res({ id: '1', subject: 'S', from: 'a', to: [], date: '2026-01-01T00:00:00Z', labels: [], attachments: [], inline_images: 0 }));
@@ -69,6 +69,17 @@ describe('addresses on the archive page', () => {
         expect(chip).toBeTruthy();
         await fireEvent.click(chip); // remove
         await waitFor(() => expect(calls[calls.length - 1].includes('acct=')).toBe(false));
+    });
+
+    it('Clear appears whenever a filter is active (reactive, not function-tracked)', async () => {
+        await mountHome({ addresses: [] });
+        expect(document.querySelector('button.clear')).toBeFalsy();
+        const btn = [...document.querySelectorAll('.label-item')].find((b) => b.textContent.includes('Social'));
+        expect(btn).toBeTruthy();
+        await fireEvent.click(btn);
+        await waitFor(() => expect(document.querySelector('button.clear')).toBeTruthy());
+        await fireEvent.click(document.querySelector('button.clear'));
+        await waitFor(() => expect(document.querySelector('button.clear')).toBeFalsy());
     });
 });
 
