@@ -897,7 +897,7 @@
         font-size: 0.8rem;
         color: #444;
         border-bottom: 1px solid #ddd;
-        background: white;
+        background: #f2f2f2;
         position: sticky;
         top: 0;
         z-index: 2;
