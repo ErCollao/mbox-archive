@@ -29,6 +29,23 @@
         setTimeout(() => { err = note = ""; }, 5000);
     }
 
+    /// Center-square crop at a sane size, output JPEG. The chooser renders
+    /// portraits square, so we crop here instead of storing a 12 MB original
+    /// and letting CSS fake it. Transparent PNGs get a white mat.
+    function cropToJpeg(img) {
+        const side = Math.min(img.naturalWidth, img.naturalHeight);
+        const c = document.createElement('canvas');
+        c.width = 512;
+        c.height = 512;
+        const ctx = c.getContext('2d');
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(0, 0, 512, 512);
+        ctx.drawImage(img,
+            (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side,
+            0, 0, 512, 512);
+        return c.toDataURL('image/jpeg', 0.9);
+    }
+
     async function pickPhoto(e) {
         const file = e.target.files?.[0];
         e.target.value = ""; // allow re-picking the same file
@@ -43,10 +60,18 @@
             r.readAsDataURL(file);
         }).catch(() => null);
         if (!data) return flash("Could not read that file.", true);
+        const img = await new Promise((resolve, reject) => {
+            const i = new Image();
+            i.onload = () => resolve(i);
+            i.onerror = () => reject(new Error("decode failed"));
+            i.src = data;
+        }).catch(() => null);
+        if (!img) return flash("That file isn't a valid image.", true);
+        const jpeg = cropToJpeg(img);
         const res = await fetch('/api/profile/portrait', {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ data })
+            body: JSON.stringify({ data: jpeg })
         });
         const out = await res.json();
         if (!res.ok) return flash(out.error || "Upload failed.", true);
