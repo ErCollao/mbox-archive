@@ -597,13 +597,15 @@
         <div class="list-head">
             <div class="lh-row">
                 <button class="burger" title="Settings" on:click={() => drawerOpen = true}>≡</button>
-                <input
-                    type="text"
-                    bind:value={query}
-                    placeholder="Search subject/sender, or from:dave subject:x"
-                    on:keydown={(e) => e.key === 'Enter' && search()}
-                />
-                <button on:click={search}>Search</button>
+                <div class="searchbox">
+                    <input
+                        type="text"
+                        bind:value={query}
+                        placeholder="Search subject/sender, or from:dave subject:x"
+                        on:keydown={(e) => e.key === 'Enter' && search()}
+                    />
+                    <button on:click={search}>Search</button>
+                </div>
                 <label class="full-cb" title="Include message bodies — scans every message, takes minutes">
                     <input type="checkbox" bind:checked={searchBodies} on:change={applyFilters} />
                     Full
@@ -905,11 +907,40 @@
         align-items: center;
         gap: 0.5rem;
     }
-    .lh-row input[type="text"] {
+    .searchbox {
+        display: flex;
+        align-items: stretch;
         flex: 1;
         min-width: 0;
-        padding: 0.35rem;
+        border: 1px solid #d0d3d8;
+        border-radius: 8px;
+        background: #fff;
+        overflow: hidden;
     }
+    .searchbox:focus-within { border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.16); }
+    .searchbox input[type="text"] {
+        flex: 1;
+        min-width: 0;
+        border: none;
+        outline: none;
+        background: transparent;
+        padding: 0.65rem 0.8rem;
+        font-size: 0.95rem;
+        font-family: inherit;
+        color: #202124;
+    }
+    .searchbox button {
+        border: none;
+        border-left: 1px solid #e8eaed;
+        background: transparent;
+        color: #80868b;
+        cursor: pointer;
+        padding: 0 0.7rem;
+        font-size: 0.95rem;
+        font-family: inherit;
+        white-space: nowrap;
+    }
+    .searchbox button:hover { background: #f1f3f4; color: #202124; }
     .lh-sub {
         justify-content: space-between;
         font-weight: 600;
