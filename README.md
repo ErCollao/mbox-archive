@@ -20,8 +20,9 @@ The app refuses to start with zero valid profiles (fail-closed), and a broken
 
 In-app: the avatar chip (top-left) opens `/profile` — set your display name
 there, change the password, or upload a portrait (JPEG/PNG/WebP, ≤12 MB; it
-shows up on the sign-in chooser). Changes are written straight to
-`profiles/<slug>/profile.json` and take effect immediately, no restart —
+shows up on the sign-in chooser, cropped in the browser to a 512px square).
+Changes are written straight to `profiles/<slug>/profile.json` and take effect
+immediately, no restart —
 the sign-in screen and the archive corner re-read the name from disk, so a
 rename never logs anyone out.
 
@@ -61,6 +62,30 @@ docker compose up -d
 
 The maintenance page (`⚙`) is the per-profile runbook: Bring Takeout →
 Merge → Re-scan → verify → Backup, with the real folder names filled in.
+
+## Keyboard shortcuts
+
+Vim-style navigation in the archive view (in-app help: press `?` or the
+bottom-left corner key). Keys never fire while you're typing in a field —
+there, `hjkl` are just letters.
+
+| Key | What |
+|---|---|
+| `h` `l` (or `←` `→`) | focus previous / next pane — the focused pane lifts with a shadow; the email pane also gets a blue frame |
+| `j` `k` (or `↓` `↑`) | move within the focused pane (filters, emails, or thread messages) |
+| `Enter` / `Space` | open email · apply highlighted filter · toggle full screen in the email pane |
+| `gg` / `G` | jump to first / last item of the focused pane |
+| `/` | jump to the search field — `Enter` runs the search and hands the keys back; `Esc` leaves the field |
+| `f` | full screen the open email |
+| `Esc` | leave an open email; elsewhere hides all highlights (cursors remember their spots) |
+| `?` | this help |
+
+## Testing
+
+```sh
+cd frontend && npm test                       # vitest + @testing-library/svelte
+docker run --rm -v "$PWD/backend:/usr/src/app" -w /usr/src/app rust:slim cargo test
+```
 
 ## Threat model
 
