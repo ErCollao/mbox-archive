@@ -49,7 +49,8 @@
     async function pollScan() {
         try {
             const s = await fetch(`${API_URL}/status`).then(r => r.json());
-            scanProg = s.search && s.search.running
+            // total 0 = queued or identity-only scan: nothing honest to show yet
+            scanProg = s.search && s.search.running && s.search.total > 0
                 ? { processed: s.search.processed, total: s.search.total }
                 : null;
         } catch (e) { /* transient */ }
@@ -1920,7 +1921,9 @@
         .pane-results {
             display: contents;
         }
-        .burger {
+        /* .lh-row prefix beats the base `.burger{display:none}` that lives
+           lower in the stylesheet (equal-specificity would lose to it) */
+        .lh-row .burger {
             display: inline-block;
         }
         .email-list {
@@ -1944,7 +1947,9 @@
         .container.drawer-open .pane-settings {
             transform: none;
         }
-        .drawer-backdrop {
+        /* element-name prefix beats the base `.drawer-backdrop{display:none}`
+           that sits below this media block (see burger note above) */
+        button.drawer-backdrop {
             display: block;
         }
         .pane-email {
