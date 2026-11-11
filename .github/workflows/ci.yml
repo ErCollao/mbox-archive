@@ -10,16 +10,19 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rust:1.99-slim
-    defaults:
-      run:
-        working-directory: backend
     steps:
-      # rust:slim ships no git; actions/checkout needs it inside the container
+      # rust:slim ships no git; actions/checkout needs it inside the container.
+      # Runs BEFORE checkout, so it must not inherit a backend/ working-directory
+      # (that dir doesn't exist yet in the container → exec chdir fails).
       - run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
         name: Install git for checkout
       - uses: actions/checkout@v4
+      - name: Clippy
+        run: rustup component add clippy && cargo clippy --all-targets -- -D warnings
+        working-directory: backend
       - name: Test
         run: cargo test
+        working-directory: backend
 
   frontend:
     runs-on: ubuntu-latest
