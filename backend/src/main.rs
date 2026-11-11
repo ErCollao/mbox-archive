@@ -16,7 +16,7 @@ use mboxshell::model::attachment::AttachmentMeta;
 use mboxshell::model::mail::MailEntry;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -50,6 +50,7 @@ struct Tenant {
     archive_dir: PathBuf,
     backup_dir: PathBuf,
     busy: Arc<AtomicBool>,
+    search: Arc<SearchProgress>,
     backup: Arc<Mutex<BackupProgress>>,
 }
 
@@ -169,6 +170,29 @@ impl Drop for BackupGuard {
     }
 }
 
+/// Live counters for in-flight searches, so "Full" body scans over hundreds
+/// of thousands of messages stop looking like a hung app. Nested searches
+/// count; the display just needs running > 0.
+#[derive(Default)]
+struct SearchProgress {
+    running: AtomicUsize,
+    processed: AtomicUsize,
+    total: AtomicUsize,
+}
+
+struct SearchGuard(Arc<SearchProgress>);
+impl SearchGuard {
+    fn new(sp: Arc<SearchProgress>) -> Self {
+        sp.running.fetch_add(1, Ordering::SeqCst);
+        Self(sp)
+    }
+}
+impl Drop for SearchGuard {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Serialize)]
 struct AttachmentInfo {
     filename: String,
@@ -273,6 +297,68 @@ fn address_counts(entries: &[MailEntry], declared: &[String]) -> Vec<(String, u6
         .collect();
     out.sort_by(|a, b| b.1.cmp(&a.1));
     out
+}
+
+/// Gmail treats `user+tag@domain` as `user@domain`. The archive index stores
+/// literal addresses, so `to:hajni@gmail.com` as a raw term would miss the
+/// digest that arrived at `hajni+news@gmail.com`. Strategy: peel full-email
+/// `to:`/`from:` terms out of the index query, run the index on the rest,
+/// then match the peeled terms here with fold-aware equality.
+/// Only simple queries (no OR/parens) are rewritten; anything fancier keeps
+/// literal semantics rather than risk changing its meaning.
+fn fold_norm(addr: &str) -> String {
+    let lower = addr.trim().trim_matches(|c| c == '<' || c == '>').to_lowercase();
+    match lower.split_once('@') {
+        Some((local, domain)) => format!("{}@{}", addr_base(local), domain),
+        None => lower,
+    }
+}
+
+/// The message's own address pool for a term field: `from` sees only the
+/// sender; `to` means "arrived via this identity", so To and CC both count.
+fn pool_for<'a>(e: &'a MailEntry, field: &str) -> Vec<&'a str> {
+    let mut v = Vec::new();
+    if field == "from" {
+        v.push(e.from.address.as_str());
+    } else {
+        for a in &e.to {
+            v.push(a.address.as_str());
+        }
+        for a in &e.cc {
+            v.push(a.address.as_str());
+        }
+    }
+    v
+}
+
+struct IdentityTerms {
+    terms: Vec<(String, String)>, // (field, folded address)
+    residual: String,             // query to hand to the index
+}
+
+fn peel_identity_terms(raw_q: &str) -> IdentityTerms {
+    let lower = raw_q.to_lowercase();
+    if !raw_q.contains(':') || lower.contains(" or ") || raw_q.contains('(') {
+        return IdentityTerms { terms: Vec::new(), residual: raw_q.to_string() };
+    }
+    let re = Regex::new(r#"(?i)\b(to|from):<?"?([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})"?>?"#).unwrap();
+    let terms: Vec<(String, String)> = re
+        .captures_iter(raw_q)
+        .map(|c| (c[1].to_lowercase(), fold_norm(&c[2])))
+        .collect();
+    if terms.is_empty() {
+        return IdentityTerms { terms: Vec::new(), residual: raw_q.to_string() };
+    }
+    let residual = re.replace_all(raw_q, "").trim().to_string();
+    IdentityTerms { terms, residual }
+}
+
+/// Threads whose message pool satisfies every peeled term (AND across
+/// fields, OR within a field — e.g. `to:a@x to:b@x` is a group mail to both).
+fn thread_matches_identities(t: &Thread, entries: &[MailEntry], terms: &[(String, String)]) -> bool {
+    terms.iter().all(|(field, folded)| {
+        t.msgs.iter().any(|&i| pool_for(&entries[i], field).iter().any(|a| fold_norm(a) == *folded))
+    })
 }
 
 fn thread_out(t: &Thread, matched: usize, entries: &[MailEntry], declared: &[String]) -> ThreadOut {
@@ -763,6 +849,7 @@ fn seed_tenant(
         archive_dir: archive_root.join(slug),
         backup_dir: backup_root.join(slug),
         busy: Arc::new(AtomicBool::new(false)),
+        search: Arc::new(SearchProgress::default()),
         backup: Arc::new(Mutex::new(BackupProgress::default())),
     }
 }
@@ -1176,77 +1263,111 @@ async fn thread_detail(Extension(state): Extension<Tenant>, Query(q): Query<TidP
 
 async fn search_handler(
     Extension(state): Extension<Tenant>,
-    Query(params): Query<FilterParams>,
+    Query(mut params): Query<FilterParams>,
 ) -> Json<Vec<ThreadOut>> {
     let inner = state.inner.clone();
     let declared = state.addresses.read().unwrap().clone();
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let raw_q = params.q.clone().unwrap_or_default();
+    let peeled = peel_identity_terms(raw_q.trim());
+    if !peeled.terms.is_empty() {
+        // the index only ever sees the remainder; the terms are enforced
+        // with fold-aware matching afterwards, where we own the semantics
+        params.q = if peeled.residual.is_empty() {
+            None
+        } else {
+            Some(peeled.residual.clone())
+        };
+    }
     let q = compose_query(&params);
-    if q.trim().is_empty() {
+    if q.trim().is_empty() && peeled.terms.is_empty() {
         return Json(Vec::new());
     }
+    let terms = peeled.terms;
+
+    let sp = state.search.clone();
 
     // The body-scan path can run for minutes on large archives: keep it off
-    // the async runtime and make its progress visible in the logs.
+    // the async runtime, log its milestones, and expose its counters.
     let items = tokio::task::spawn_blocking(move || {
+        let _guard = SearchGuard::new(sp.clone());
         let lock = inner.read().unwrap();
-        let mbox_path = match &lock.mbox_path {
-            Some(p) => p.clone(),
-            None => return Vec::new(),
+        let s = parse_sel(&params);
+
+        let mut tids: Vec<usize>;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+
+        let acct_ok = |ti: usize| -> bool {
+            s.addrs.is_empty()
+                || lock.threads[ti].msgs.iter().any(|&i| {
+                    let tags = entry_tags(&lock.entries[i], &declared);
+                    s.addrs.iter().any(|a| tags.iter().any(|tg| tg.eq_ignore_ascii_case(a)))
+                })
         };
-        let progress = |processed: usize, total: usize| {
-            if processed > 0 && processed % 5000 == 0 {
-                info!("Body search progress: {}/{} messages", processed, total);
+
+        if q.trim().is_empty() {
+            // identity-only query ("to:hajni@gmail.com"): every thread whose
+            // messages satisfy all terms; thread_order is already newest-first
+            tids = lock.thread_order.iter().copied()
+                .filter(|&ti| thread_matches_identities(&lock.threads[ti], &lock.entries, &terms) && acct_ok(ti))
+                .collect();
+            for &ti in &tids {
+                let t = &lock.threads[ti];
+                let matched = t.msgs.iter().filter(|&&i| {
+                    let e = &lock.entries[i];
+                    terms.iter().any(|(f, folded)| pool_for(e, f).iter().any(|a| fold_norm(a) == *folded))
+                }).count();
+                counts.insert(t.tid.clone(), matched);
             }
-            true
-        };
-        match search::execute(&mbox_path, &lock.entries, &q, Some(&progress)) {
-            Ok((_, results)) => {
-                // Fold matching messages into their threads; a thread shows if
-                // any message matches, with `matched` counting the hits.
-                let mut counts: HashMap<String, usize> = HashMap::new();
-                let mut tids: Vec<usize> = Vec::new();
-                for &idx in &results {
-                    let tid = tid_of(&lock.entries, idx);
-                    let c = counts.entry(tid.clone()).or_insert(0);
-                    *c += 1;
-                    if *c == 1 {
-                        if let Some(&ti) = lock.tmap.get(&tid) {
-                            tids.push(ti);
+        } else {
+            let mbox_path = match &lock.mbox_path {
+                Some(p) => p.clone(),
+                None => return Vec::new(),
+            };
+            let progress = |processed: usize, total: usize| {
+                sp.processed.store(processed, Ordering::Relaxed);
+                sp.total.store(total, Ordering::Relaxed);
+                if processed > 0 && processed % 5000 == 0 {
+                    info!("Body search progress: {}/{} messages", processed, total);
+                }
+                true
+            };
+            match search::execute(&mbox_path, &lock.entries, &q, Some(&progress)) {
+                Ok((_, results)) => {
+                    // Fold matching messages into their threads; a thread shows if
+                    // any message matches, with `matched` counting the hits.
+                    tids = Vec::new();
+                    for &idx in &results {
+                        let tid = tid_of(&lock.entries, idx);
+                        let c = counts.entry(tid.clone()).or_insert(0);
+                        *c += 1;
+                        if *c == 1 {
+                            if let Some(&ti) = lock.tmap.get(&tid) {
+                                tids.push(ti);
+                            }
                         }
                     }
+                    tids.sort_by(|&a, &b| lock.threads[b].date.cmp(&lock.threads[a].date));
+                    // identity terms and the account filter narrow results
+                    // here, after the query — the archive cannot speak of them
+                    tids.retain(|&ti| thread_matches_identities(&lock.threads[ti], &lock.entries, &terms) && acct_ok(ti));
                 }
-                tids.sort_by(|&a, &b| lock.threads[b].date.cmp(&lock.threads[a].date));
-                // identity tags are not part of the archive's own vocabulary,
-                // so an account filter narrows results here, after the query
-                let s = parse_sel(&params);
-                let tids: Vec<usize> = if s.addrs.is_empty() {
-                    tids
-                } else {
-                    tids.into_iter()
-                        .filter(|&ti| {
-                            lock.threads[ti].msgs.iter().any(|&i| {
-                                let tags = entry_tags(&lock.entries[i], &declared);
-                                s.addrs.iter().any(|a| tags.iter().any(|t| t.eq_ignore_ascii_case(a)))
-                            })
-                        })
-                        .collect()
-                };
-                tids.iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|&ti| {
-                        let t = &lock.threads[ti];
-                        thread_out(t, counts.get(&t.tid).copied().unwrap_or(0), &lock.entries, &declared)
-                    })
-                    .collect()
-            }
-            Err(e) => {
-                warn!("Search failed: {}", e);
-                Vec::new()
+                Err(e) => {
+                    warn!("Search failed: {}", e);
+                    return Vec::new();
+                }
             }
         }
+
+        tids.iter()
+            .skip(offset)
+            .take(limit)
+            .map(|&ti| {
+                let t = &lock.threads[ti];
+                thread_out(t, counts.get(&t.tid).copied().unwrap_or(0), &lock.entries, &declared)
+            })
+            .collect()
     })
     .await
     .unwrap_or_else(|_| Vec::new());
@@ -1479,6 +1600,40 @@ mod address_tests {
         ], "counted tags only, count desc, ties in declaration order");
         assert!(address_counts(&entries, &["solo@x.y".to_string()]).is_empty());
     }
+
+    #[test]
+    fn fold_norm_strips_decoration_and_plus() {
+        assert_eq!(fold_norm("<HAJNI+News@Gmail.com>"), "hajni@gmail.com");
+        assert_eq!(fold_norm("plain@x.io"), "plain@x.io");
+    }
+
+    #[test]
+    fn peel_only_touches_simple_full_email_terms() {
+        let p = peel_identity_terms("to:hajni@gmail.com subject:digest");
+        assert_eq!(p.terms, vec![("to".to_string(), "hajni@gmail.com".to_string())]);
+        assert_eq!(p.residual, "subject:digest");
+
+        let one_field = peel_identity_terms("to:daniel@collado-ruiz.es");
+        assert_eq!(one_field.terms.len(), 1);
+        assert!(one_field.residual.is_empty(), "identity-only query: terms carry the meaning");
+
+        let by_name = peel_identity_terms("from:dave subject:x");
+        assert!(by_name.terms.is_empty() && by_name.residual == "from:dave subject:x", "non-email term stays raw");
+        let complex = peel_identity_terms("to:a@x.io OR to:b@y.io");
+        assert!(complex.terms.is_empty(), "OR-queries keep literal semantics");
+    }
+
+    #[test]
+    fn search_guard_counts_nested_runs() {
+        let sp = std::sync::Arc::new(SearchProgress::default());
+        assert_eq!(sp.running.load(Ordering::SeqCst), 0);
+        let g1 = SearchGuard::new(sp.clone());
+        let g2 = SearchGuard::new(sp.clone());
+        assert_eq!(sp.running.load(Ordering::SeqCst), 2);
+        drop(g1);
+        drop(g2);
+        assert_eq!(sp.running.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[derive(Serialize)]
@@ -1488,11 +1643,20 @@ struct StatusOut {
     total: u64,
     oldest_ts: i64,
     latest_ts: i64,
+    search: SearchOut,
     backup: BackupProgress,
+}
+
+#[derive(Serialize)]
+struct SearchOut {
+    running: bool,
+    processed: u64,
+    total: u64,
 }
 
 async fn status_handler(Extension(state): Extension<Tenant>) -> Json<StatusOut> {
     let lock = state.inner.read().unwrap();
+    let running = state.search.running.load(Ordering::SeqCst) > 0;
     Json(StatusOut {
         busy: state.busy.load(Ordering::SeqCst),
         source: lock
@@ -1502,6 +1666,11 @@ async fn status_handler(Extension(state): Extension<Tenant>) -> Json<StatusOut> 
         total: lock.facets.total,
         oldest_ts: lock.facets.min_ts,
         latest_ts: lock.facets.max_ts,
+        search: SearchOut {
+            running,
+            processed: if running { state.search.processed.load(Ordering::Relaxed) as u64 } else { 0 },
+            total: if running { state.search.total.load(Ordering::Relaxed) as u64 } else { 0 },
+        },
         backup: state.backup.lock().unwrap().clone(),
     })
 }
@@ -2347,7 +2516,7 @@ Thanks, reviewing it now.
 
     const LUNCH_MBOX: &str = r#"From dave@example.com Thu Jan  8 12:00:00 2026
 From: Dave Liang <dave@example.com>
-To: me@example.com
+To: me+inbox@example.com
 Subject: Lunch plans
 Date: Thu, 8 Jan 2026 12:00:00 +0000
 Message-ID: <l1@example.com>
@@ -2613,5 +2782,39 @@ Same message id, corrected body text here.
         assert!(list[0].get("accts").is_none(), "one identity is not a distinction");
         let (_, fac) = get_json(&app, "/api/filters", Some(&cookie)).await;
         assert_eq!(fac["addresses"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn identity_search_folds_aliases_and_status_reports_search() {
+        let env = Env::new("idsearch");
+        env.add("daniel", "Daniel", "daniel");
+        env.mail("daniel", "full.mbox", &format!("{THREAD_MBOX}\n{LUNCH_MBOX}"));
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+        scan(&app, &cookie).await;
+        let st = wait_indexed(&app, &cookie, 3).await;
+        assert_eq!(st["search"]["running"], false, "idle status exposes the search block");
+        assert_eq!(st["search"]["processed"], 0);
+
+        // to:me@example.com must find the lunch thread whose To literally says
+        // me+inbox@example.com — the whole point of fold-aware identity terms
+        let t = threads(&app, &cookie, "/api/search?q=to:me@example.com").await;
+        let subjects: Vec<&str> = t.as_array().unwrap().iter().map(|x| x["subject"].as_str().unwrap()).collect();
+        assert!(subjects.contains(&"Lunch plans"), "plus-alias recipient found: {subjects:?}");
+        assert!(subjects.contains(&"Quarterly report"));
+
+        // from: narrows to the sender pool only
+        let t = threads(&app, &cookie, "/api/search?q=to:dave@example.com").await;
+        assert_eq!(t.as_array().unwrap().len(), 1, "only the reply went to dave");
+        assert_eq!(t[0]["subject"], "Quarterly report");
+
+        // term + residual query: both constraints apply
+        let t = threads(&app, &cookie, "/api/search?q=to:me@example.com%20subject:lunch").await;
+        assert_eq!(t.as_array().unwrap().len(), 1);
+        assert_eq!(t[0]["subject"], "Lunch plans");
+
+        // unknown identity finds nothing
+        let t = threads(&app, &cookie, "/api/search?q=to:nobody@nowhere.io").await;
+        assert_eq!(t.as_array().unwrap().len(), 0);
     }
 }
