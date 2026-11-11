@@ -23,9 +23,16 @@ function forwarded(response) {
 
 const TEXT_TYPES = /json|text|html|xml|javascript/;
 
+/** The backend only ever speaks /api/... — refuse dot-segments that could
+ *  walk the constructed URL onto another path after URL normalization. */
+function guarded(path) {
+    if (path && path.includes('..')) throw error(400, 'invalid path');
+    return path;
+}
+
 /** @type {import('./$types').RequestHandler} */
 export async function GET({ params, url, request }) {
-    const targetUrl = `${BACKEND_URL}/api/${params.path}${url.search}`;
+    const targetUrl = `${BACKEND_URL}/api/${guarded(params.path)}${url.search}`;
     let response;
     try {
         response = await fetch(targetUrl, {
@@ -50,7 +57,7 @@ export async function GET({ params, url, request }) {
 
 /** @type {import('./$types').RequestHandler} */
 export async function POST({ params, request }) {
-    const targetUrl = `${BACKEND_URL}/api/${params.path}`;
+    const targetUrl = `${BACKEND_URL}/api/${guarded(params.path)}${new URL(request.url).search}`;
     let response;
     try {
         response = await fetch(targetUrl, {
@@ -71,7 +78,7 @@ export async function POST({ params, request }) {
 
 /** @type {import('./$types').RequestHandler} */
 export async function DELETE({ params, request }) {
-    const targetUrl = `${BACKEND_URL}/api/${params.path}${new URL(request.url).search}`;
+    const targetUrl = `${BACKEND_URL}/api/${guarded(params.path)}${new URL(request.url).search}`;
     let response;
     try {
         response = await fetch(targetUrl, {
