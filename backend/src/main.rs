@@ -494,9 +494,20 @@ fn fold_quotes(html: &str) -> String {
 }
 
 fn strip_scripts(html: &str) -> String {
-    match Regex::new(r"(?is)<script[^>]*>.*?(</script>|$)|</?script[^>]*>") {
-        Ok(re) => re.replace_all(html, "").into_owned(),
-        Err(_) => html.to_string(),
+    // Loop to a fixed point: a single pass lets split markers reassemble into
+    // a fresh <script> ("<sc<script></script>ript>"). The sandboxed iframe
+    // would neutralize it anyway, but this layer must not merely look busy.
+    let re = match Regex::new(r"(?is)<script[^>]*>.*?(</script>|$)|</?script[^>]*>") {
+        Ok(r) => r,
+        Err(_) => return html.to_string(),
+    };
+    let mut cur = html.to_string();
+    loop {
+        let next = re.replace_all(&cur, "").into_owned();
+        if next == cur {
+            return cur;
+        }
+        cur = next;
     }
 }
 
@@ -1540,6 +1551,24 @@ async fn get_attachment_data(
             (headers, bytes).into_response()
         }
         None => (StatusCode::NOT_FOUND, "Attachment not found").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod html_tests {
+    use super::strip_scripts;
+
+    #[test]
+    fn split_and_nested_script_tags_cannot_reassemble() {
+        let out = strip_scripts("<sc<script></script>ript>alert(1)</scr</script>ipt><p>hi</p>");
+        assert!(!out.to_lowercase().contains("script"), "{out}");
+        assert!(out.contains("<p>hi</p>"));
+    }
+
+    #[test]
+    fn benign_html_survives() {
+        let src = "<table><tr><td>ok</td></tr></table>";
+        assert_eq!(strip_scripts(src), src);
     }
 }
 
