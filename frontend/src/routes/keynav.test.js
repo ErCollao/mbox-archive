@@ -306,4 +306,19 @@ describe('vim key navigation', () => {
         await key(window, 'Enter');
         expect(document.querySelector('.container.email-expanded')).toBeFalsy();
     });
+
+    it('the list is an accessible listbox driven by the same cursor', async () => {
+        const { calls } = await mount();
+        const list = document.querySelector('.email-list');
+        expect(list.getAttribute('role')).toBe('listbox');
+        expect(list.getAttribute('tabindex')).toBe('0');
+        expect(document.querySelectorAll('[role="option"]').length).toBe(2);
+        await fireEvent.focus(list); // focusing claims the pane, like l would
+        expect(document.querySelector('.pane-results.kbd-focus')).toBeTruthy();
+        await key(list, 'ArrowDown');
+        expect(list.getAttribute('aria-activedescendant')).toBe('email-row-0');
+        expect(document.querySelectorAll('.email-item')[0].classList.contains('kcursor')).toBe(true);
+        await fireEvent.keyDown(list, { key: 'Enter' }); // local open, single path
+        await waitFor(() => expect(calls.some((u) => String(u).startsWith('/api/thread'))).toBe(true));
+    });
 });

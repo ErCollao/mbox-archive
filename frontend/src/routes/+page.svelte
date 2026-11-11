@@ -40,7 +40,29 @@
     let listIdx = -1;         // cursor over emails
     let leftIdx = 0;          // cursor over filter buttons (index into visible DOM)
     let stickBottom = false;  // load-more in flight: ride the cursor to the new end
+    let scanProg = null;        // {processed,total} while a body scan runs
+    let scanPoll = null;
     let leftPane, listEl, searchInput;
+
+    // "Full" body scans run for minutes; the backend counts them in
+    // /api/status/search, so the spinner can become a counter
+    async function pollScan() {
+        try {
+            const s = await fetch(`${API_URL}/status`).then(r => r.json());
+            scanProg = s.search && s.search.running
+                ? { processed: s.search.processed, total: s.search.total }
+                : null;
+        } catch (e) { /* transient */ }
+    }
+    function startScanPoll() {
+        stopScanPoll();
+        pollScan();
+        scanPoll = setInterval(pollScan, 1200);
+    }
+    function stopScanPoll() {
+        if (scanPoll) { clearInterval(scanPoll); scanPoll = null; }
+        scanProg = null;
+    }
 
     const TEXT_INPUT_TYPES = ['text', 'search', 'email', 'password', 'number', 'tel', 'url', ''];
 
@@ -59,6 +81,7 @@
         window.addEventListener('resize', remeasure);
         window.addEventListener('mouseup', remeasure); // column drags end here
         return () => {
+            stopScanPoll(); // never leave a timer outliving the view
             document.removeEventListener('focusout', reclaimKeys);
             window.removeEventListener('blur', reclaimKeys);
             window.removeEventListener('resize', remeasure);
@@ -151,6 +174,16 @@
         // is coming) on screen instead of gluing the last row to the edge
         const target = (moreBtn && cur === rows[rows.length - 1]) ? moreBtn : cur;
         target.scrollIntoView({ block: 'nearest' });
+    }
+
+    // the listbox is a single tab stop; Enter/Space open the cursor row and
+    // stop here, arrows/j-k keep flowing to the global vim handler
+    function onListKeys(e) {
+        if ((e.key === 'Enter' || e.key === ' ') && emails[listIdx]) {
+            e.preventDefault();
+            e.stopPropagation();
+            openThread(emails[listIdx].tid);
+        }
     }
 
     async function moveList(dir) {
@@ -588,6 +621,7 @@
         selectedThread = null;
         threadMsgs = [];
         activeMsgId = null;
+        if (searchBodies) startScanPoll();
         try {
             const p = facetParams();
             p.set("q", trimmed);
@@ -604,6 +638,7 @@
             console.error(e);
         } finally {
             loading = false;
+            stopScanPoll();
         }
     }
 
@@ -877,7 +912,7 @@
             <div class="lh-row lh-sub">
                 <span class="status">
                     {#if loading && emails.length === 0}
-                        Searching...
+                        Searching…{#if scanProg}<span class="scanprog">{fmtCount(scanProg.processed)} / {fmtCount(scanProg.total)} bodies scanned</span>{/if}
                     {:else if mode === 'search'}
                         {emails.length} conversation{emails.length === 1 ? '' : 's'}
                     {:else}
@@ -893,12 +928,24 @@
             </div>
         </div>
 
-        <div class="email-list" bind:this={listEl}>
+        <div
+            class="email-list"
+            bind:this={listEl}
+            role="listbox"
+            aria-label="Email conversations"
+            tabindex="0"
+            aria-activedescendant={pane === 'list' && listIdx >= 0 ? 'email-row-' + listIdx : null}
+            on:focus={() => { if (pane !== 'list') pane = 'list'; }}
+            on:keydown={onListKeys}
+        >
             {#if loading && emails.length === 0}
                 <div class="loading">
-                    {mode === 'search' && searchBodies
-                        ? 'Scanning every message body — minutes on a large archive...'
-                        : 'Loading...'}
+                    {#if mode === 'search' && searchBodies}
+                        Scanning every message body — minutes on a large archive…
+                        {#if scanProg}<span class="scanprog">{fmtCount(scanProg.processed)} / {fmtCount(scanProg.total)}</span>{/if}
+                    {:else}
+                        Loading...
+                    {/if}
                 </div>
             {:else if emails.length === 0}
                 {#if mode === 'search'}
@@ -911,8 +958,14 @@
                 {/if}
             {:else}
                 {#each emails as t, i (t.tid)}
+                    <!-- svelte-ignore a11y-click-events-have-key-events a11y-interactive-supports-focus -->
+                    <!-- the listbox container owns the keyboard; options are
+                         announced via aria-activedescendant, not tab stops -->
                     <div
+                        id="email-row-{i}"
                         class="email-item"
+                        role="option"
+                        aria-selected={selectedThread && selectedThread.tid === t.tid}
                         class:selected={selectedThread && selectedThread.tid === t.tid}
                         class:kcursor={pane === 'list' && i === listIdx}
                         on:click={() => { listIdx = i; openThread(t.tid); }}
@@ -1244,6 +1297,10 @@
         align-items: center;
         gap: 0.4rem;
         flex-wrap: wrap;
+    }
+    .scanprog {
+        color: #1a73e8;
+        font-weight: 600;
     }
     .af-chip {
         background: #1a73e8;

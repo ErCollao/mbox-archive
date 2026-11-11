@@ -87,8 +87,11 @@
             <p class="sub">Password</p>
             <form class="pwgroup" on:submit|preventDefault={submit}>
                 {#if showPw}
+                    <!-- svelte-ignore a11y-autofocus -->
+                    <!-- an appliance should be loggable-in the moment it opens -->
                     <input type="text" bind:value={pw} placeholder="password" autocomplete="current-password" autofocus />
                 {:else}
+                    <!-- svelte-ignore a11y-autofocus -->
                     <input type="password" bind:value={pw} placeholder="password" autocomplete="current-password" autofocus />
                 {/if}
                 <button type="button" class="seg" title={showPw ? 'Hide password' : 'Show password'} on:click={() => showPw = !showPw}>
