@@ -29,7 +29,6 @@ use std::{
 use mboxshell::index::builder;
 use mboxshell::search;
 use mboxshell::store::reader::MboxStore;
-use tower_http::cors::CorsLayer;
 use walkdir::WalkDir;
 use tracing::{debug, info, error, warn};
 
@@ -888,7 +887,9 @@ fn build_app(root: Root) -> Router {
         .route("/api/logout", post(logout_handler))
         .route("/profiles/:slug/portrait", get(portrait_handler))
         .merge(protected)
-        .layer(CorsLayer::permissive())
+        // No CORS: the SvelteKit server proxies /api same-origin, so the API
+        // has no legitimate cross-origin browser caller — refusing CORS means
+        // other websites cannot poke this appliance with a user's cookie.
         .with_state(root)
 }
 
@@ -1394,49 +1395,56 @@ async fn get_email_content(
         Err(_) => return "Invalid ID".to_string().into_response(),
     };
 
-    let lock = state.inner.read().unwrap();
-    let mbox_path = match &lock.mbox_path {
-        Some(p) => p,
-        None => return "No MBOX loaded".to_string().into_response(),
+    let (mbox_path, entry) = {
+        let lock = state.inner.read().unwrap();
+        match (&lock.mbox_path, lock.entries.get(idx)) {
+            (Some(p), Some(e)) => (p.clone(), e.clone()),
+            (None, _) => return "No MBOX loaded".to_string().into_response(),
+            (_, None) => return "Email not found".to_string().into_response(),
+        }
     };
 
-    let entry = match lock.entries.get(idx) {
-        Some(e) => e,
-        None => return "Email not found".to_string().into_response(),
-    };
-
-    let mut store = match MboxStore::open(mbox_path) {
-        Ok(s) => s,
-        Err(_) => return "Could not open MBOX".to_string().into_response(),
-    };
-
-    match store.get_message(entry) {
-        Ok(body) => {
-            // Prefer HTML if available, otherwise Text
-            if let Some(html) = &body.html {
-                let html = rewrite_cid(html, &body.attachments, &id);
-                // Untrusted email HTML: strip scripts (the frame adds back
-                // only its own height-reporter), fold quoted history safely.
-                let html = strip_scripts(&fold_quotes(&html));
-                // Folded quotes live inside the email document; ship a style
-                // so the summary matches the app chrome instead of serif.
-                let html = if html.contains("<details class=\"quotes\"") {
-                    format!("{FOLD_STYLE}{html}")
-                } else {
-                    html
-                };
-                let html = format!("{BASE_STYLE}{html}");
-                let mut headers = HeaderMap::new();
-                headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
-                headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-                (headers, axum::response::Html(html)).into_response()
-            } else if let Some(text) = &body.text {
-                text.clone().into_response()
+    // MIME parsing plus regex surgery on untrusted HTML: real work that
+    // belongs off the async runtime, like every other heavy handler here
+    let rendered = tokio::task::spawn_blocking(move || -> Option<(bool, Vec<u8>)> {
+        let mut store = MboxStore::open(&mbox_path).ok()?;
+        let body = store.get_message(&entry).ok()?;
+        if let Some(html) = &body.html {
+            let html = rewrite_cid(html, &body.attachments, &id);
+            // Untrusted email HTML: strip scripts (the frame adds back
+            // only its own height-reporter), fold quoted history safely.
+            let html = strip_scripts(&fold_quotes(&html));
+            // Folded quotes live inside the email document; ship a style
+            // so the summary matches the app chrome instead of serif.
+            let html = if html.contains("<details class=\"quotes\"") {
+                format!("{FOLD_STYLE}{html}")
             } else {
-                "No content".to_string().into_response()
+                html
+            };
+            let html = format!("{BASE_STYLE}{html}");
+            Some((true, html.into_bytes()))
+        } else if let Some(text) = &body.text {
+            Some((false, text.clone().into_bytes()))
+        } else {
+            Some((false, b"No content".to_vec()))
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match rendered {
+        Some((is_html, bytes)) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static("sandbox"));
+            headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+            if is_html {
+                (headers, axum::response::Html(bytes)).into_response()
+            } else {
+                (headers, String::from_utf8_lossy(&bytes).into_owned()).into_response()
             }
         }
-        Err(e) => format!("Error reading email: {}", e).into_response(),
+        None => "Could not read email".to_string().into_response(),
     }
 }
 

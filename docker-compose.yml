@@ -9,6 +9,14 @@ services:
       - ${BACKUP_DIR:-./backup}:/backup
       - index-data:/index
     restart: unless-stopped
+    healthcheck:
+      # /api/profiles is the one endpoint that answers without a session,
+      # so it doubles as a liveness probe; a broken backend never says OK
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/profiles"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   frontend:
     build: ./frontend
@@ -17,7 +25,15 @@ services:
     environment:
       - BACKEND_URL=http://backend:3000
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/welcome').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 volumes:
   index-data:

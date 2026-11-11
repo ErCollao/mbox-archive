@@ -1,4 +1,4 @@
-FROM node:slim AS builder
+FROM node:26-slim AS builder
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -7,7 +7,7 @@ COPY . .
 RUN npm run build
 RUN npm prune --production
 
-FROM node:slim
+FROM node:26-slim
 WORKDIR /app
 COPY --from=builder /app/build build/
 COPY --from=builder /app/node_modules node_modules/

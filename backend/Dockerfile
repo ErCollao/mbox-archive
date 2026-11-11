@@ -1,4 +1,4 @@
-FROM rust:slim AS builder
+FROM rust:1.99-slim AS builder
 
 WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y pkg-config libssl-dev libzstd-dev && rm -rf /var/lib/apt/lists/*
@@ -14,9 +14,9 @@ RUN mkdir src && printf 'fn main() {}\n' > src/main.rs \
 COPY src ./src
 RUN find src -exec touch {} + && cargo build --release --locked
 
-FROM debian:stable-slim
+FROM debian:13-slim
 # Final image needs libzstd too
-RUN apt-get update && apt-get install -y libssl-dev ca-certificates libzstd1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates libzstd1 curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/src/app/target/release/mbox-browser-backend /usr/local/bin/mbox-browser-backend
 EXPOSE 3000
 CMD ["mbox-browser-backend"]

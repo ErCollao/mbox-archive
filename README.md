@@ -89,6 +89,42 @@ docker compose up -d
 The maintenance page (`⚙`) is the per-profile runbook: Bring Takeout →
 Merge → Re-scan → verify → Backup, with the real folder names filled in.
 
+## Deployment guide
+
+**Requirements:** Docker with compose v2. RAM scales with the archive — the
+in-memory index keeps roughly 500 bytes per message (1M messages ≈ 500 MB),
+on top of disk space for the mbox files themselves. Two people's full
+Takeouts run comfortably on a small box or Pi-class machine with a few GB.
+
+**First run:**
+
+1. Bootstrap at least one profile (see *Passwords, names & photos* — the
+   backend deliberately refuses to start with zero valid profiles).
+2. `docker compose up -d --build`
+3. First boot auto-creates `archive/session.key` and indexes every profile's
+   newest mbox. Wait for `Indexing complete` in `docker compose logs backend`
+   on very large archives (a 300k-message index takes seconds, not minutes).
+4. Open `http://<host>:3132` from any device on the LAN.
+
+**Updates:** `git pull && docker compose up -d --build`. Data never leaves
+the bind-mounted folders, so updates and rollbacks are stateless.
+
+**Health:** both services carry healthchecks — `docker compose ps` shows
+`healthy`; `docker compose logs -f backend` shows indexing, merges and
+body-scan milestones. The frontend waits for the backend to be healthy
+before starting.
+
+**Backups:** the maintenance page produces verified gzip snapshots into
+`backup/<profile>/`. Nothing schedules them yet — a nightly
+`tar czf backup-snapshot.tgz backup/ profiles/ archive/` cron (or a Synology
+task) on the host covers it. `profiles/` is small and precious: it holds the
+password hashes and address lists.
+
+**Exposing beyond the LAN:** don't put this on the open internet as-is.
+For remote access, terminate TLS in a reverse proxy (Caddy/nginx) *and* add
+authentication in front; the app itself ships no TLS, no Secure cookie flag,
+no rate limiting, and no account lockout by design.
+
 ## Keyboard shortcuts
 
 Vim-style navigation in the archive view (in-app help: press `?` or the
@@ -140,3 +176,10 @@ behind the home router — this is a family appliance, not a vault.
 Sessions are HMAC-signed year cookies carrying `slug:expiry:fingerprint`
 (`archive/session.key`); delete that file to log everyone out at once, or
 change a password to evict just that one person's older sessions.
+Cookies are `HttpOnly; SameSite=Lax`; the API sends no CORS headers at all,
+so other websites cannot ride a logged-in user's cookie. Email HTML is
+served with a `sandbox` CSP and rendered in a scriptless sandboxed iframe;
+attachment previews downgrade markup types to plain downloads.
+Known and accepted: profile names and portraits are readable without login
+(the sign-in chooser needs it), and there is no login rate limiting or
+lockout — acceptable next to "anyone on the LAN could just unplug the disk".
