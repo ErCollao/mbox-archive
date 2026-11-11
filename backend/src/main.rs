@@ -16,7 +16,7 @@ use mboxshell::model::attachment::AttachmentMeta;
 use mboxshell::model::mail::MailEntry;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -170,26 +170,31 @@ impl Drop for BackupGuard {
     }
 }
 
-/// Live counters for in-flight searches, so "Full" body scans over hundreds
-/// of thousands of messages stop looking like a hung app. Nested searches
-/// count; the display just needs running > 0.
+/// Per-request slots for in-flight searches, so "Full" body scans over
+/// hundreds of thousands of messages stop looking like a hung app — and so
+/// two overlapping searches never show each other's numbers. Slots are keyed
+/// by a request id and removed when the guard drops, whatever the exit path
+/// (completion, error, panic): the counters cannot leak.
 #[derive(Default)]
 struct SearchProgress {
-    running: AtomicUsize,
-    processed: AtomicUsize,
-    total: AtomicUsize,
+    next_id: AtomicU64,
+    slots: Mutex<HashMap<u64, (usize, usize)>>,
 }
 
-struct SearchGuard(Arc<SearchProgress>);
+struct SearchGuard {
+    sp: Arc<SearchProgress>,
+    id: u64,
+}
 impl SearchGuard {
     fn new(sp: Arc<SearchProgress>) -> Self {
-        sp.running.fetch_add(1, Ordering::SeqCst);
-        Self(sp)
+        let id = sp.next_id.fetch_add(1, Ordering::SeqCst);
+        sp.slots.lock().unwrap().insert(id, (0, 0));
+        Self { sp, id }
     }
 }
 impl Drop for SearchGuard {
     fn drop(&mut self) {
-        self.0.running.fetch_sub(1, Ordering::SeqCst);
+        self.sp.slots.lock().unwrap().remove(&self.id);
     }
 }
 
@@ -1292,6 +1297,7 @@ async fn search_handler(
     // the async runtime, log its milestones, and expose its counters.
     let items = tokio::task::spawn_blocking(move || {
         let _guard = SearchGuard::new(sp.clone());
+        let my_id = _guard.id;
         let lock = inner.read().unwrap();
         let s = parse_sel(&params);
 
@@ -1326,8 +1332,10 @@ async fn search_handler(
                 None => return Vec::new(),
             };
             let progress = |processed: usize, total: usize| {
-                sp.processed.store(processed, Ordering::Relaxed);
-                sp.total.store(total, Ordering::Relaxed);
+                if let Some(slot) = sp.slots.lock().unwrap().get_mut(&my_id) {
+                    slot.0 = processed;
+                    slot.1 = total;
+                }
                 if processed > 0 && processed % 5000 == 0 {
                     // the user-visible truth lives in /api/status.search now;
                     // this is only for server-side diagnosis
@@ -1626,15 +1634,26 @@ mod address_tests {
     }
 
     #[test]
-    fn search_guard_counts_nested_runs() {
+    fn search_guard_slots_are_isolated_and_raii() {
         let sp = std::sync::Arc::new(SearchProgress::default());
-        assert_eq!(sp.running.load(Ordering::SeqCst), 0);
+        assert!(sp.slots.lock().unwrap().is_empty());
         let g1 = SearchGuard::new(sp.clone());
         let g2 = SearchGuard::new(sp.clone());
-        assert_eq!(sp.running.load(Ordering::SeqCst), 2);
+        let (id1, id2) = (g1.id, g2.id);
+        assert_ne!(id1, id2, "each request owns its slot");
+        {
+            let mut s = sp.slots.lock().unwrap();
+            assert_eq!(s.len(), 2);
+            s.get_mut(&id1).unwrap().0 = 77;
+            s.get_mut(&id2).unwrap().0 = 5;
+            assert_eq!(s[&id1].0, 77, "counters never bleed across requests");
+        }
         drop(g1);
+        assert_eq!(sp.slots.lock().unwrap().len(), 1);
+        assert!(!sp.slots.lock().unwrap().contains_key(&id1), "drop reclaims the slot");
+        assert!(sp.slots.lock().unwrap().contains_key(&id2));
         drop(g2);
-        assert_eq!(sp.running.load(Ordering::SeqCst), 0);
+        assert!(sp.slots.lock().unwrap().is_empty());
     }
 }
 
@@ -1658,7 +1677,15 @@ struct SearchOut {
 
 async fn status_handler(Extension(state): Extension<Tenant>) -> Json<StatusOut> {
     let lock = state.inner.read().unwrap();
-    let running = state.search.running.load(Ordering::SeqCst) > 0;
+    // newest slot = the search the user started last, which is the one worth
+    // showing when several are somehow in flight
+    let (search_running, s_processed, s_total) = {
+        let slots = state.search.slots.lock().unwrap();
+        match slots.iter().max_by_key(|(id, _)| *id) {
+            Some((_, (p, t))) => (true, *p as u64, *t as u64),
+            None => (false, 0, 0),
+        }
+    };
     Json(StatusOut {
         busy: state.busy.load(Ordering::SeqCst),
         source: lock
@@ -1669,9 +1696,9 @@ async fn status_handler(Extension(state): Extension<Tenant>) -> Json<StatusOut> 
         oldest_ts: lock.facets.min_ts,
         latest_ts: lock.facets.max_ts,
         search: SearchOut {
-            running,
-            processed: if running { state.search.processed.load(Ordering::Relaxed) as u64 } else { 0 },
-            total: if running { state.search.total.load(Ordering::Relaxed) as u64 } else { 0 },
+            running: search_running,
+            processed: s_processed,
+            total: s_total,
         },
         backup: state.backup.lock().unwrap().clone(),
     })
