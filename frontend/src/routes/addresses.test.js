@@ -71,20 +71,18 @@ describe('addresses on the archive page', () => {
         await waitFor(() => expect(calls[calls.length - 1].includes('acct=')).toBe(false));
     });
 
-    it('chips appear on selection and vanish on removal (no stale pills)', async () => {
+    it('category selection shows in the breadcrumb, never as a duplicate chip, and toggles off', async () => {
         await mountHome({ addresses: [] });
-        const chips = () => [...document.querySelectorAll('.af-chip')].map((c) => c.textContent.trim());
+        expect(document.querySelector('.status').textContent.trim()).toBe('Inbox');
         const social = [...document.querySelectorAll('.label-item')].find((b) => b.textContent.includes('Social'));
         await fireEvent.click(social);
-        await waitFor(() => expect(chips().some((t) => t.includes('Social'))).toBe(true));
-        await fireEvent.click([...document.querySelectorAll('.af-chip')].find((c) => c.textContent.includes('Social')));
-        await waitFor(() => expect(chips().length).toBe(0));
-        expect([...document.querySelectorAll('.label-item.on')].length).toBe(0); // sidebar agrees
+        await waitFor(() => expect(document.querySelector('.status').textContent).toContain('Social'));
+        expect(document.querySelectorAll('.af-chip').length).toBe(0); // breadcrumb, not pill
+        await fireEvent.click(social); // same click deselects
+        await waitFor(() => expect(document.querySelector('.status').textContent.trim()).toBe('Inbox'));
     });
 
-    it('the boot auto-selected category raises its chip immediately', async () => {
-        // custom fixture WITH Category Personal: onMount auto-selects it,
-        // which used to render no chip until some other state changed
+    it('the boot auto-selected category names itself in the breadcrumb', async () => {
         vi.stubGlobal('fetch', (url) => {
             const u = String(url);
             const r = (b) => ({ ok: true, status: 200, json: async () => b });
@@ -94,7 +92,7 @@ describe('addresses on the archive page', () => {
             throw new Error('unmocked ' + u);
         });
         render(Home);
-        await waitFor(() => expect([...document.querySelectorAll('.af-chip')].map((c) => c.textContent).join()).toContain('Personal'));
+        await waitFor(() => expect(document.querySelector('.status').textContent).toContain('Personal'));
     });
 
     it('statuses collapse to two plus a show-all toggle, like labels', async () => {

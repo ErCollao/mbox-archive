@@ -424,11 +424,6 @@
         applyFilters();
     }
 
-    function fieldFor(name) {
-        for (const [k, v] of Object.entries(sel)) if (v === name) return k;
-        return null;
-    }
-
     // reactive derived, not a function: the compiler cannot see through
     // function calls in templates, which left the old anyFilter() call sites
     // stale (Clear button refused to appear)
@@ -449,27 +444,25 @@
     }
 
     // direct state reads everywhere: reactive statements and templates do not
-    // track dependencies through function calls (activeLabels()/dateRangeText()
-    // used to leave stale chips — the Clear-button bug in another costume)
+    // track dependencies through function calls (the old activeLabels()/
+    // dateRangeText() calls left stale chips — the Clear-button bug in costume)
+    // Division of labour: the breadcrumb names WHERE you are (category ›
+    // status — also toggled off by re-clicking them in the sidebar), while
+    // removable pills cover filters that are not a place (labels, addresses,
+    // attachments, dates) — which is why cat/status are deliberately absent
+    // from chipList: no duplicated name next to its own pill
+    $: breadcrumb = [sel.cat, sel.status].filter(v => v !== null).map(dispFor).join(' › ') || 'Inbox';
     $: chipList = [
-        ...(sel.cat ? [{ kind: "label", n: sel.cat }] : []),
-        ...(sel.status ? [{ kind: "label", n: sel.status }] : []),
         ...selOther.map(n => ({ kind: "label", n })),
         ...(hasAttachments ? [{ kind: "att", n: "" }] : []),
         ...selAcct.map(a => ({ kind: "acct", n: a })),
         ...(afterTs !== null || beforeTs !== null ? [{ kind: "date", n: "" }] : [])
     ];
-    $: pathText = [sel.cat, sel.status, ...selOther].filter(v => v !== null).map(dispFor).join(' › ') || 'Inbox';
     $: dateRangeTxt = `${afterTs !== null ? fmtMonth(afterTs) : "…"} – ${beforeTs !== null ? fmtMonth(beforeTs - DAY) : "…"}`;
 
     function removeChip(c) {
         if (c.kind === "label") {
-            if (selOther.includes(c.n)) {
-                selOther = selOther.filter(n => n !== c.n);
-            } else {
-                const f = fieldFor(c.n);
-                if (f) sel = { ...sel, [f]: null };
-            }
+            selOther = selOther.filter(n => n !== c.n);
         } else if (c.kind === "att") {
             hasAttachments = false;
         } else if (c.kind === "acct") {
@@ -888,7 +881,7 @@
                     {:else if mode === 'search'}
                         {emails.length} conversation{emails.length === 1 ? '' : 's'}
                     {:else}
-                        {pathText}
+                        {breadcrumb}
                     {/if}
                     {#each chipList as c (c.kind + c.n)}
                         <button class="af-chip" title="Remove filter" on:click={() => removeChip(c)}>
