@@ -101,6 +101,9 @@ there, `hjkl` are just letters.
 | `j` `k` (or `↓` `↑`) | move within the focused pane (filters, emails, or thread messages) |
 | `Enter` / `Space` | open email · apply highlighted filter · toggle full screen in the email pane |
 | `gg` / `G` | jump to first / last item of the focused pane |
+| `d` / `u` | half page down / up in the list (keeps loading more at the end, like `j`) |
+| `y` / `p` | copy a link to what's on screen / open the last copied link |
+| `c` | clear all filters |
 | `/` | jump to the search field — `Enter` runs the search and hands the keys back; `Esc` leaves the field |
 | `f` | full screen the open email |
 | `Esc` | leave an open email; elsewhere hides all highlights (cursors remember their spots) |

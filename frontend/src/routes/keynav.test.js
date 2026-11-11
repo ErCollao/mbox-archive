@@ -328,6 +328,43 @@ describe('vim key navigation', () => {
         expect(rows[1].classList.contains('kcursor')).toBe(true);
     });
 
+    it('d jumps half a page and clamps at the last row', async () => {
+        await mount();
+        await key(window, 'd'); // cold-start claims the list, then moves
+        const rows = document.querySelectorAll('.email-item');
+        expect(document.querySelector('.pane-results.kbd-focus')).toBeTruthy();
+        expect(rows[rows.length - 1].classList.contains('kcursor')).toBe(true); // 2-row fixture: half-page lands on the clamp
+    });
+
+    it('y copies the on-screen link and p returns to it', async () => {
+        const { calls } = await mount();
+        const writeText = vi.fn(async () => {});
+        Object.defineProperty(window.navigator, 'clipboard', { value: { writeText }, configurable: true });
+
+        await key(window, 'l'); await key(window, 'j'); await key(window, 'Enter');
+        await waitFor(() => expect(document.querySelector('.msg-head')).toBeTruthy());
+        await key(window, 'l'); // into the email pane, so Esc is the "close" gesture
+        await key(window, 'y');
+        await waitFor(() => expect(writeText).toHaveBeenCalled());
+        expect(String(writeText.mock.calls[0][0])).toContain('?t=');
+        expect(document.querySelector('.kbd-toast').textContent).toBe('link copied');
+
+        await key(window, 'Escape'); // closes the thread
+        await waitFor(() => expect(document.querySelector('.msg-head')).toBeFalsy());
+        const before = calls.length;
+        await key(window, 'p');
+        await waitFor(() => expect(document.querySelector('.msg-head')).toBeTruthy());
+        expect(calls.length).toBeGreaterThan(before);
+    });
+
+    it('c clears every filter', async () => {
+        await mount();
+        expect(document.querySelector('button.clear')).toBeTruthy(); // boot auto-select
+        await key(window, 'c');
+        await waitFor(() => expect(document.querySelector('button.clear')).toBeFalsy());
+        expect(document.querySelector('.label-item.on')).toBeFalsy();
+    });
+
     it('f and Enter toggle full screen in the email pane', async () => {
         await mount();
         await key(window, 'l'); await key(window, 'j'); await key(window, 'Enter'); // open

@@ -235,6 +235,72 @@
 
     let gPending = 0;
 
+    // ---------- d/u, y, p, c ----------
+
+    function halfPage() {
+        if (!listEl) return 8;
+        const first = listEl.querySelector('.email-item');
+        const rowH = first && first.offsetHeight ? first.offsetHeight : 64;
+        return Math.max(3, Math.round(listEl.clientHeight / rowH / 2));
+    }
+
+    async function moveListPage(dir) {
+        if (!emails.length) return;
+        if (dir === 1 && listIdx === emails.length - 1 && morePending() && !loading) {
+            nextPage(); // d at the end keeps loading pages, like j
+            return;
+        }
+        const start = listIdx < 0 ? (dir === 1 ? 0 : 0) : listIdx;
+        listIdx = Math.max(0, Math.min(start + dir * halfPage(), emails.length - 1));
+        await paintListCursor();
+    }
+
+    let toast = '';
+    let toastBad = false;
+    let toastTimer = null;
+    function showToast(msg, bad = false) {
+        toast = msg;
+        toastBad = bad;
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => { toast = ''; }, 1800);
+    }
+
+    let yankedUrl = null;
+    async function copyText(t) {
+        try {
+            if (navigator.clipboard && await navigator.clipboard.writeText(t).then(() => true, () => false)) return true;
+        } catch (e) { /* insecure context or denied */ }
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = t;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand ? document.execCommand('copy') : false;
+            ta.remove();
+            return !!ok;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function visitYanked() {
+        if (!yankedUrl) { showToast('nothing copied yet', true); return; }
+        const u = new URL(yankedUrl, window.location.href);
+        const t = u.searchParams.get('t');
+        if (!t) {
+            if (selectedThread) closeThread();
+            return;
+        }
+        if (selectedThread && selectedThread.tid === t) {
+            const m = u.searchParams.get('m');
+            if (m && threadMsgs.some(x => x.id === m)) loadMessage(m);
+            return;
+        }
+        openThread(t, u.searchParams.get('m'));
+    }
+
     const KEYMAP = { ArrowLeft: 'h', ArrowRight: 'l', ArrowDown: 'j', ArrowUp: 'k' };
 
     function onKey(e) {
@@ -270,6 +336,22 @@
             if (pane === 'email' && selectedThread) expanded = !expanded;
             return;
         }
+        if (k === 'd' || k === 'u') {
+            e.preventDefault(); // d/u never scroll the page itself
+            if (pane === null) pane = 'list';
+            if (pane === 'list') moveListPage(k === 'd' ? 1 : -1);
+            return;
+        }
+        if (k === 'y') {
+            const url = window.location.href;
+            copyText(url).then((ok) => {
+                if (ok) { yankedUrl = url; showToast('link copied'); }
+                else showToast('copy failed', true);
+            });
+            return;
+        }
+        if (k === 'p') { visitYanked(); return; }
+        if (k === 'c') { clearFilters(); return; }
         gPending = 0;
         if (k === '/') {
             e.preventDefault();
@@ -1153,6 +1235,10 @@
 
 <div class="kbd-frame" class:show={pane === 'email'} style={frameStyle}></div>
 
+{#if toast}
+    <div class="kbd-toast" class:bad={toastBad} role="status">{toast}</div>
+{/if}
+
 <button class="help-key" title="Keyboard shortcuts (?)" aria-label="Toggle keyboard shortcuts" on:click={() => helpOpen = !helpOpen}>?</button>
 
 {#if helpOpen}
@@ -1165,6 +1251,10 @@
                 <div><span class="keys"><kbd>j</kbd><kbd>↓</kbd> / <kbd>k</kbd><kbd>↑</kbd></span><span>move within the focused pane</span></div>
                 <div><span class="keys"><kbd>Enter</kbd> / <kbd>Space</kbd></span><span>open email · apply highlighted filter · toggle full screen (email pane)</span></div>
                 <div><span class="keys"><kbd>g</kbd><kbd>g</kbd> / <kbd>G</kbd></span><span>jump to first / last item of the focused pane</span></div>
+                <div><span class="keys"><kbd>d</kbd> / <kbd>u</kbd></span><span>half page down / up in the list</span></div>
+                <div><span class="keys"><kbd>y</kbd></span><span>copy a link to what's on screen</span></div>
+                <div><span class="keys"><kbd>p</kbd></span><span>open the last copied link</span></div>
+                <div><span class="keys"><kbd>c</kbd></span><span>clear all filters</span></div>
                 <div><span class="keys"><kbd>/</kbd></span><span>search — <kbd>Enter</kbd> runs it, <kbd>Esc</kbd> leaves the field</span></div>
                 <div><span class="keys"><kbd>f</kbd></span><span>full screen the open email</span></div>
                 <div><span class="keys"><kbd>Esc</kbd></span><span>leave an open email · otherwise hide all highlights</span></div>
@@ -1578,6 +1668,20 @@
     .kbd-frame.show {
         visibility: visible;
     }
+    .kbd-toast {
+        position: fixed;
+        bottom: 1.1rem;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 200;
+        padding: 0.35rem 0.9rem;
+        border-radius: 14px;
+        background: #202124;
+        color: #fff;
+        font-size: 0.8rem;
+        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+    }
+    .kbd-toast.bad { background: #b3261e; }
     .help-key {
         position: fixed;
         left: 0.8rem;
