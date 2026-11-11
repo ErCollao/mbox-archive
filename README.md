@@ -183,3 +183,15 @@ attachment previews downgrade markup types to plain downloads.
 Known and accepted: profile names and portraits are readable without login
 (the sign-in chooser needs it), and there is no login rate limiting or
 lockout — acceptable next to "anyone on the LAN could just unplug the disk".
+
+## Credits
+
+All mbox heavy lifting comes from [mboxshell](https://github.com/dcarrero/mboxshell)
+(MIT): parsing Gmail Takeout exports, the on-disk binary message index, and
+full-text search. Built on top of it: thread grouping by `X-GM-THRID`, facet
+counts and the filter language, identity/address tagging, the archive
+lifecycle (merge → scan → backup), and the entire web UI.
+
+## License
+
+[MIT](LICENSE.md) — free to use, modify, and share, with attribution.
