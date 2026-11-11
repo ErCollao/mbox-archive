@@ -67,6 +67,12 @@
 
     const TEXT_INPUT_TYPES = ['text', 'search', 'email', 'password', 'number', 'tel', 'url', ''];
 
+    // Clicks bubble focus to the nearest focusable ancestor (the listbox),
+    // so on:focus alone cannot tell "user tabbed in" from "user clicked".
+    // Track the last interaction modality to claim the pane for keyboard
+    // focus only — a mouse click must never steal keyboard ownership.
+    let kbLast = false;
+
     // clicking inside the sandboxed email iframe steals key focus from the
     // document — events then never reach us. Yank it back the moment focus
     // moves into a frame (focusout on the parent is the reliable signal;
@@ -76,12 +82,19 @@
         if (stolen && stolen.tagName === 'IFRAME') setTimeout(() => stolen.blur(), 0);
     }
     onMount(() => {
+        const markKb = () => { kbLast = true; };
+        const markMouse = () => { kbLast = false; };
+        document.addEventListener('keydown', markKb, true);
+        document.addEventListener('mousedown', markMouse, true);
+        document.addEventListener('touchstart', markMouse, true);
         document.addEventListener('focusout', reclaimKeys);
         window.addEventListener('blur', reclaimKeys);
         const remeasure = () => updateFrame();
         window.addEventListener('resize', remeasure);
         window.addEventListener('mouseup', remeasure); // column drags end here
+        window.addEventListener('popstate', onPopState); // browser Back exits emails
         return () => {
+            window.removeEventListener('popstate', onPopState);
             stopScanPoll(); // never leave a timer outliving the view
             document.removeEventListener('focusout', reclaimKeys);
             window.removeEventListener('blur', reclaimKeys);
@@ -660,7 +673,7 @@
         // Deep link: /?t=<thread>&m=<message>
         const p = new URLSearchParams(window.location.search);
         const tid = p.get("t");
-        if (tid) openThread(tid, p.get("m"));
+        if (tid) openThread(tid, p.get("m"), false);
     });
 
     // ---------- threads: one message at a time (B) ----------
@@ -683,16 +696,35 @@
         }
     }
 
-    // Deep-linking: keep the URL in sync with the opened thread/message
-    // (replaceState: shareable/bookmarkable, without polluting history).
+    // Deep-linking: keep the URL in sync with the opened thread/message.
+    // setUrl replaces (message steps never stack); openThread pushes one
+    // history entry per thread, so browser Back exits the email instead of
+    // the app.
     function setUrl(tid, mid) {
         const u = new URL(window.location.href);
         if (tid) u.searchParams.set("t", tid); else u.searchParams.delete("t");
         if (mid) u.searchParams.set("m", mid); else u.searchParams.delete("m");
-        history.replaceState(history.state, "", u);
+        history.replaceState({ t: tid ?? undefined }, "", u);
     }
 
-    async function openThread(tid, mid) {
+    function pushUrl(tid) {
+        const u = new URL(window.location.href);
+        u.searchParams.set("t", tid);
+        u.searchParams.delete("m");
+        history.pushState({ t: tid }, "", u);
+    }
+
+    function onPopState(e) {
+        const t = e.state?.t ?? new URLSearchParams(window.location.search).get("t");
+        if (!t) {
+            if (selectedThread) closeThread();
+        } else if (!selectedThread || selectedThread.tid !== t) {
+            openThread(t, null, false);
+        }
+    }
+
+    async function openThread(tid, mid, push = true) {
+        if (push) pushUrl(tid);
         selectedThread = { tid, subject: "" };
         threadMsgs = [];
         activeMsgId = null;
@@ -936,7 +968,7 @@
             aria-label="Email conversations"
             tabindex="0"
             aria-activedescendant={pane === 'list' && listIdx >= 0 ? 'email-row-' + listIdx : null}
-            on:focus={() => { if (pane !== 'list') pane = 'list'; }}
+            on:focus={() => { if (kbLast && pane !== 'list') pane = 'list'; }}
             on:keydown={onListKeys}
         >
             {#if loading && emails.length === 0}
@@ -1130,6 +1162,7 @@
                 <div><span class="keys"><kbd>/</kbd></span><span>search — <kbd>Enter</kbd> runs it, <kbd>Esc</kbd> leaves the field</span></div>
                 <div><span class="keys"><kbd>f</kbd></span><span>full screen the open email</span></div>
                 <div><span class="keys"><kbd>Esc</kbd></span><span>leave an open email · otherwise hide all highlights</span></div>
+                <div><span class="keys"><kbd>Back</kbd></span><span>the browser button closes an open email (opening one pushes a history entry)</span></div>
                 <div><span class="keys"><kbd>?</kbd></span><span>this help</span></div>
             </div>
             <button on:click={() => helpOpen = false}>Close</button>

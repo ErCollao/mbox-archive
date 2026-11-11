@@ -41,8 +41,8 @@ function mockFetch(big = false) {
     return calls;
 }
 
-async function key(win, k, opts = {}) {
-    await fireEvent.keyDown(window, { key: k, ...opts });
+async function key(target, k, opts = {}) {
+    await fireEvent.keyDown(target, { key: k, ...opts });
     await tick();
 }
 
@@ -175,6 +175,21 @@ describe('vim key navigation', () => {
         });
         await waitFor(() => expect(document.querySelector('.back-btn')).toBeTruthy());
         expect(document.querySelector('.kbd-focus')).toBeFalsy(); // mouse mode: no pane ring
+        await fireEvent.focus(document.querySelector('.email-list')); // click-bubbled focus must not claim
+        expect(document.querySelector('.kbd-focus')).toBeFalsy();
+    });
+
+    it('opening a thread pushes history so Back can exit it', async () => {
+        await mount();
+        await key(window, 'l'); await key(window, 'j'); await key(window, 'Enter');
+        await waitFor(() => expect(document.querySelector('.msg-head')).toBeTruthy());
+        // t1 was pushed on open; the mock thread identifies itself as t2 and
+        // the message step replaces ?t — either way a t= must be in history
+        expect(window.location.search).toContain('t=t2');
+        // emulate the browser landing back on the pre-thread entry
+        window.history.replaceState(null, '', '/');
+        window.dispatchEvent(new PopStateEvent('popstate', { state: null }));
+        await waitFor(() => expect(document.querySelector('.msg-head')).toBeFalsy());
     });
 
     it('G at the bottom loads the next page and the cursor rides along', async () => {
@@ -313,7 +328,8 @@ describe('vim key navigation', () => {
         expect(list.getAttribute('role')).toBe('listbox');
         expect(list.getAttribute('tabindex')).toBe('0');
         expect(document.querySelectorAll('[role="option"]').length).toBe(2);
-        await fireEvent.focus(list); // focusing claims the pane, like l would
+        await key(document.body, 'Shift'); // keyboard interaction precedes keyboard focus (must traverse document capture, like real keydowns)
+        await fireEvent.focus(list); // focusing with kb intent claims the pane, like l would
         expect(document.querySelector('.pane-results.kbd-focus')).toBeTruthy();
         await key(list, 'ArrowDown');
         expect(list.getAttribute('aria-activedescendant')).toBe('email-row-0');

@@ -104,6 +104,7 @@ there, `hjkl` are just letters.
 | `/` | jump to the search field — `Enter` runs the search and hands the keys back; `Esc` leaves the field |
 | `f` | full screen the open email |
 | `Esc` | leave an open email; elsewhere hides all highlights (cursors remember their spots) |
+| browser Back | closes an open email (opening a thread pushes a history entry, so Back steps out of the email, not out of the app) |
 | `?` | this help |
 
 ## Testing
