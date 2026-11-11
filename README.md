@@ -274,9 +274,10 @@ production: read-only, or don't touch.
 
 ## 🔐 Security & threat model
 
-**LAN-only by design.** One shared password per profile, bcrypt-verified
-over plain HTTP behind the home router — this is a family appliance, not
-a vault. **Don't put this on the open internet as-is:** the app ships no
+**LAN-only by design.** One password per household member — each person's
+login opens only their own archive, nobody shares credentials —
+bcrypt-verified over plain HTTP behind the home router. This is a family
+appliance, not a vault. **Don't put this on the open internet as-is:** the app ships no
 TLS, no Secure cookie flag, no rate limiting, and no account lockout.
 For remote access, terminate TLS in a reverse proxy (Caddy/nginx) *and*
 add authentication in front.
