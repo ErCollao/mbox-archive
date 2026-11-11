@@ -67,7 +67,7 @@ pub(crate) fn address_counts(entries: &[MailEntry], declared: &[String]) -> Vec<
         .map(|d| (d.clone(), counts.get(d).copied().unwrap_or(0)))
         .filter(|(_, c)| *c > 0)
         .collect();
-    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     out
 }
 

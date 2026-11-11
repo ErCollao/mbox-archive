@@ -34,7 +34,7 @@ pub(crate) struct ThreadOut {
     pub(crate) accts: Vec<String>,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Default)]
 pub(crate) struct Facets {
     pub(crate) labels: Vec<(String, u64)>,
     #[serde(default)]
@@ -42,12 +42,6 @@ pub(crate) struct Facets {
     pub(crate) min_ts: i64,
     pub(crate) max_ts: i64,
     pub(crate) total: u64,
-}
-
-impl Default for Facets {
-    fn default() -> Self {
-        Facets { labels: Vec::new(), addresses: Vec::new(), min_ts: 0, max_ts: 0, total: 0 }
-    }
 }
 
 #[derive(Deserialize)]

@@ -35,10 +35,9 @@ pub(crate) fn metadata_for(inner: &AppStateInner, idx: usize) -> EmailMetadata {
 }
 
 /// Identity tagging: which *declared* addresses involve this message.
-/// Tags are derived at read time from index fields that already exist
-/// (from/to/cc) — nothing is stored, so editing the list relabels the
-/// whole archive instantly and merges/rescans are unaffected.
-
+// Tags are derived at read time from index fields that already exist
+// (from/to/cc) — nothing is stored, so editing the list relabels the
+// whole archive instantly and merges/rescans are unaffected.
 pub(crate) async fn merge_handler(Extension(state): Extension<Tenant>) -> Json<ScanResponse> {
     let data_dir = state.data_dir.clone();
     let archive_dir = state.archive_dir.clone();
@@ -48,7 +47,7 @@ pub(crate) async fn merge_handler(Extension(state): Extension<Tenant>) -> Json<S
         let _busy = BusyGuard(state.busy.clone());
         let mut mbox_files: Vec<(PathBuf, SystemTime)> = Vec::new();
         for entry in WalkDir::new(&data_dir).into_iter().filter_map(|e| e.ok()) {
-            if entry.path().extension().map_or(false, |ext| ext == "mbox") {
+            if entry.path().extension().is_some_and(|ext| ext == "mbox") {
                 let mt = entry
                     .metadata()
                     .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
@@ -128,7 +127,7 @@ pub(crate) async fn merge_handler(Extension(state): Extension<Tenant>) -> Json<S
                     info!("Merging {:?}: {}/{}", path.file_name().unwrap_or_default(), i, entries.len());
                 }
                 if !entry.message_id.is_empty()
-                    && owner.get(&entry.message_id).map_or(false, |o| *o != fidx)
+                    && owner.get(&entry.message_id).is_some_and(|o| *o != fidx)
                 {
                     dups += 1;
                     continue;
@@ -155,7 +154,7 @@ pub(crate) async fn merge_handler(Extension(state): Extension<Tenant>) -> Json<S
             out.flush()?;
             let mut file = out
                 .into_inner()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             file.flush()?;
             fs::rename(&tmp, &output)
         };
@@ -198,7 +197,7 @@ pub(crate) async fn scan_handler(Extension(state): Extension<Tenant>) -> Json<Sc
             // loudly if several exist, since only one gets indexed.
             let mut candidates: Vec<(PathBuf, SystemTime)> = Vec::new();
             for entry in WalkDir::new(&data_dir).into_iter().filter_map(|e| e.ok()) {
-                 if entry.path().extension().map_or(false, |ext| ext == "mbox") {
+                 if entry.path().extension().is_some_and(|ext| ext == "mbox") {
                      let mt = entry
                          .metadata()
                          .map(|m| m.modified().unwrap_or(SystemTime::UNIX_EPOCH))
@@ -471,7 +470,7 @@ pub(crate) async fn search_handler(
                     slot.0 = processed;
                     slot.1 = total;
                 }
-                if processed > 0 && processed % 5000 == 0 {
+                if processed > 0 && processed.is_multiple_of(5000) {
                     // the user-visible truth lives in /api/status.search now;
                     // this is only for server-side diagnosis
                     debug!("Body search progress: {}/{} messages", processed, total);
@@ -706,9 +705,44 @@ pub(crate) async fn status_handler(Extension(state): Extension<Tenant>) -> Json<
     })
 }
 
+/// Keep only the newest `keep` verified backups; older ones are pruned after
+/// a successful backup lands. `BACKUP_KEEP=0` disables pruning entirely.
+pub(crate) fn prune_old_backups(dir: &std::path::Path, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let mut backups: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let p = entry.path();
+        let is_backup = p.file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("mbox-archive-") && n.ends_with(".mbox.gz"))
+            .unwrap_or(false);
+        if !is_backup {
+            continue;
+        }
+        if let Ok(mt) = entry.metadata().and_then(|m| m.modified()) {
+            backups.push((mt, p));
+        }
+    }
+    if backups.len() <= keep {
+        return;
+    }
+    backups.sort_by_key(|(mt, _)| *mt);
+    let drop_n = backups.len() - keep;
+    for (_, p) in backups.into_iter().take(drop_n) {
+        match fs::remove_file(&p) {
+            Ok(()) => info!("pruned old backup {:?}", p.file_name().unwrap_or_default()),
+            Err(e) => warn!("could not prune backup {:?}: {}", p, e),
+        }
+    }
+}
+
 /// Safe copy of the current archive, gzip-compressed: written to a temp file
 /// with progress reporting, verified by full decompression, then atomically
 /// renamed — a partial or corrupt backup never appears as a completed one.
+/// After a successful backup, older snapshots are pruned (see prune_old_backups).
 pub(crate) async fn backup_handler(Extension(state): Extension<Tenant>) -> Json<BackupOut> {
     let fail = |m: String| {
         Json(BackupOut {
@@ -797,6 +831,8 @@ pub(crate) async fn backup_handler(Extension(state): Extension<Tenant>) -> Json<
         }
 
         fs::rename(&tmp, &target).map_err(|e| format!("finalizing failed: {}", e))?;
+        let keep: usize = std::env::var("BACKUP_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        prune_old_backups(&backup_dir, keep);
         let gz = fs::metadata(&target).map_err(|e| e.to_string())?.len();
         Ok((
             target.to_string_lossy().to_string(),

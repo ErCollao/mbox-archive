@@ -665,3 +665,40 @@ Same message id, corrected body text here.
         let t = threads(&app, &cookie, "/api/search?q=to:nobody@nowhere.io").await;
         assert_eq!(t.as_array().unwrap().len(), 0);
     }
+
+    #[tokio::test]
+    async fn successful_backups_prune_to_keep_the_latest_ten() {
+        let env = Env::new("prune");
+        env.add("daniel", "Daniel", "daniel");
+        env.mail("daniel", "export.mbox", THREAD_MBOX);
+        let app = env.app();
+        let cookie = cookie_of(&login(&app, "daniel", "daniel").await);
+        scan(&app, &cookie).await;
+        wait_indexed(&app, &cookie, 2).await;
+
+        let bdir = env.backup.join("daniel");
+        fs::create_dir_all(&bdir).unwrap();
+        for i in 0..12u64 {
+            let p = bdir.join(format!("mbox-archive-2024{i:05}-000000.mbox.gz"));
+            fs::write(&p, b"not a real backup").unwrap();
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000 + i);
+            fs::File::options().write(true).open(&p).unwrap().set_modified(when).unwrap();
+        }
+        let sentinel = bdir.join("readme.txt");
+        fs::write(&sentinel, b"mine").unwrap();
+
+        assert_eq!(post(&app, &cookie, "/api/backup").await, StatusCode::OK);
+
+        let left: Vec<String> = fs::read_dir(&bdir).unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let gzs: Vec<&String> = left.iter().filter(|n| n.ends_with(".mbox.gz")).collect();
+        assert_eq!(gzs.len(), 10, "12 fakes + 1 fresh -> newest 10 kept: {gzs:?}");
+        for gone in ["mbox-archive-202400000-000000.mbox.gz", "mbox-archive-202400001-000000.mbox.gz", "mbox-archive-202400002-000000.mbox.gz"] {
+            assert!(!left.iter().any(|n| n == gone), "oldest fake {gone} should be pruned");
+        }
+        assert!(left.iter().any(|n| n == "mbox-archive-202400011-000000.mbox.gz"), "newest fake survives");
+        assert!(left.iter().any(|n| n.starts_with("mbox-archive-202") && !n.starts_with("mbox-archive-2024")), "fresh backup survives");
+        assert!(fs::metadata(&sentinel).is_ok(), "unrelated files are never touched");
+    }

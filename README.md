@@ -115,7 +115,9 @@ body-scan milestones. The frontend waits for the backend to be healthy
 before starting.
 
 **Backups:** the maintenance page produces verified gzip snapshots into
-`backup/<profile>/`. Nothing schedules them yet — a nightly
+`backup/<profile>/`, and after each successful backup prunes all but the ten
+newest `mbox-archive-*.mbox.gz` there (tune with `BACKUP_KEEP` in the
+environment; `0` disables pruning). Nothing schedules them yet — a nightly
 `tar czf backup-snapshot.tgz backup/ profiles/ archive/` cron (or a Synology
 task) on the host covers it. `profiles/` is small and precious: it holds the
 password hashes and address lists.
