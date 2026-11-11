@@ -11,6 +11,7 @@
     let selAcct = [];
     let acctFacets = [];
     let showAllLabels = false;
+    let showAllStatuses = false;
     let labels = [];
     let facetMin = 0;
     let facetMax = 0;
@@ -403,10 +404,6 @@
         { head: "Status", field: "status", items: statusItems }
     ].filter(g => g.items.length);
 
-    function activeLabels() {
-        return [sel.cat, sel.status, ...selOther].filter(v => v !== null);
-    }
-
     function pick(field, name) {
         if (field === "other") {
             selOther = selOther.includes(name)
@@ -451,18 +448,19 @@
         return p;
     }
 
+    // direct state reads everywhere: reactive statements and templates do not
+    // track dependencies through function calls (activeLabels()/dateRangeText()
+    // used to leave stale chips — the Clear-button bug in another costume)
     $: chipList = [
-        ...activeLabels().map(n => ({ kind: "label", n })),
+        ...(sel.cat ? [{ kind: "label", n: sel.cat }] : []),
+        ...(sel.status ? [{ kind: "label", n: sel.status }] : []),
+        ...selOther.map(n => ({ kind: "label", n })),
         ...(hasAttachments ? [{ kind: "att", n: "" }] : []),
         ...selAcct.map(a => ({ kind: "acct", n: a })),
         ...(afterTs !== null || beforeTs !== null ? [{ kind: "date", n: "" }] : [])
     ];
-
-    function dateRangeText() {
-        const a = afterTs !== null ? fmtMonth(afterTs) : "…";
-        const b = beforeTs !== null ? fmtMonth(beforeTs - DAY) : "…";
-        return `${a} – ${b}`;
-    }
+    $: pathText = [sel.cat, sel.status, ...selOther].filter(v => v !== null).map(dispFor).join(' › ') || 'Inbox';
+    $: dateRangeTxt = `${afterTs !== null ? fmtMonth(afterTs) : "…"} – ${beforeTs !== null ? fmtMonth(beforeTs - DAY) : "…"}`;
 
     function removeChip(c) {
         if (c.kind === "label") {
@@ -817,7 +815,10 @@
                                 </button>
                             {/if}
                         {:else}
-                            {#each g.items as [name, count] (name)}
+                            {@const first = g.items.slice(0, 2)}
+                            {@const collapsed = g.field === 'status' && !showAllStatuses && g.items.length > 2
+                                && (!sel.status || first.some(([n]) => n === sel.status))}
+                            {#each collapsed ? first : g.items as [name, count] (name)}
                                 {@const on = sel[g.field] === name}
                                 <button
                                     class="label-item"
@@ -831,6 +832,11 @@
                                     <span class="count">{fmtCount(count)}</span>
                                 </button>
                             {/each}
+                            {#if g.field === 'status' && g.items.length > 2}
+                                <button class="label-item show-more" on:click={() => showAllStatuses = !showAllStatuses}>
+                                    <span class="lname">{collapsed ? `Show all ${g.items.length} statuses` : 'Show fewer statuses'}</span>
+                                </button>
+                            {/if}
                         {/if}
                     </div>
                 {/each}
@@ -882,11 +888,11 @@
                     {:else if mode === 'search'}
                         {emails.length} conversation{emails.length === 1 ? '' : 's'}
                     {:else}
-                        {activeLabels().map(dispFor).join(' › ') || 'Inbox'}
+                        {pathText}
                     {/if}
                     {#each chipList as c (c.kind + c.n)}
                         <button class="af-chip" title="Remove filter" on:click={() => removeChip(c)}>
-                            {c.kind === 'label' ? dispFor(c.n) : c.kind === 'att' ? 'Has attachments' : c.kind === 'acct' ? c.n : dateRangeText()} ×
+                            {c.kind === 'label' ? dispFor(c.n) : c.kind === 'att' ? 'Has attachments' : c.kind === 'acct' ? c.n : dateRangeTxt} ×
                         </button>
                     {/each}
                 </span>

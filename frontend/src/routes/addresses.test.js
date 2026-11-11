@@ -23,7 +23,7 @@ function stubHome({ addresses = [] } = {}) {
         const u = String(url);
         calls.push(u);
         if (u.startsWith('/api/whoami')) return Promise.resolve(res({ slug: 'd', name: 'D' }));
-        if (u.startsWith('/api/filters')) return Promise.resolve(res({ labels: [['Category Social', 4], ['Inbox', 3]], addresses: addresses.map((a, i) => [a, 10 - i]), min_ts: 0, max_ts: 86400000 * 40, total: 2 }));
+        if (u.startsWith('/api/filters')) return Promise.resolve(res({ labels: [['Category Social', 4], ['Inbox', 3], ['Important', 2], ['Starred', 1]], addresses: addresses.map((a, i) => [a, 10 - i]), min_ts: 0, max_ts: 86400000 * 40, total: 2 }));
         if (u.startsWith('/api/messages')) return Promise.resolve(res(rows));
         if (u.startsWith('/api/thread')) return Promise.resolve(res({ tid: 't1', subject: 'First', messages: [] }));
         if (/meta/.test(u)) return Promise.resolve(res({ id: '1', subject: 'S', from: 'a', to: [], date: '2026-01-01T00:00:00Z', labels: [], attachments: [], inline_images: 0 }));
@@ -69,6 +69,48 @@ describe('addresses on the archive page', () => {
         expect(chip).toBeTruthy();
         await fireEvent.click(chip); // remove
         await waitFor(() => expect(calls[calls.length - 1].includes('acct=')).toBe(false));
+    });
+
+    it('chips appear on selection and vanish on removal (no stale pills)', async () => {
+        await mountHome({ addresses: [] });
+        const chips = () => [...document.querySelectorAll('.af-chip')].map((c) => c.textContent.trim());
+        const social = [...document.querySelectorAll('.label-item')].find((b) => b.textContent.includes('Social'));
+        await fireEvent.click(social);
+        await waitFor(() => expect(chips().some((t) => t.includes('Social'))).toBe(true));
+        await fireEvent.click([...document.querySelectorAll('.af-chip')].find((c) => c.textContent.includes('Social')));
+        await waitFor(() => expect(chips().length).toBe(0));
+        expect([...document.querySelectorAll('.label-item.on')].length).toBe(0); // sidebar agrees
+    });
+
+    it('the boot auto-selected category raises its chip immediately', async () => {
+        // custom fixture WITH Category Personal: onMount auto-selects it,
+        // which used to render no chip until some other state changed
+        vi.stubGlobal('fetch', (url) => {
+            const u = String(url);
+            const r = (b) => ({ ok: true, status: 200, json: async () => b });
+            if (u.startsWith('/api/whoami')) return Promise.resolve(r({ slug: 'd', name: 'D' }));
+            if (u.startsWith('/api/filters')) return Promise.resolve(r({ labels: [['Category Personal', 5], ['Inbox', 3]], addresses: [], min_ts: 0, max_ts: 86400000 * 40, total: 2 }));
+            if (u.startsWith('/api/messages')) return Promise.resolve(r([{ tid: 't1', subject: 'F', from: 'a', date: '2026-01-01T00:00:00Z', count: 1, matched: 0, attachments: false }]));
+            throw new Error('unmocked ' + u);
+        });
+        render(Home);
+        await waitFor(() => expect([...document.querySelectorAll('.af-chip')].map((c) => c.textContent).join()).toContain('Personal'));
+    });
+
+    it('statuses collapse to two plus a show-all toggle, like labels', async () => {
+        await mountHome({ addresses: [] });
+        const statusBtns = () => [...document.querySelectorAll('.label-item')].map((b) => b.textContent.trim());
+        const shown = statusBtns();
+        expect(shown.some((t) => t.startsWith('Inbox'))).toBe(true);
+        expect(shown.some((t) => t.startsWith('Important'))).toBe(true);
+        expect(shown.some((t) => t.startsWith('Starred'))).toBe(false); // hidden while collapsed
+        const toggle = [...document.querySelectorAll('.label-item.show-more')].find((b) => b.textContent.includes('Show all 3 statuses'));
+        expect(toggle).toBeTruthy();
+        await fireEvent.click(toggle);
+        await waitFor(() => expect(statusBtns().some((t) => t.startsWith('Starred'))).toBe(true));
+        expect([...document.querySelectorAll('.show-more')].map((b) => b.textContent).join()).toContain('Show fewer');
+        await fireEvent.click([...document.querySelectorAll('.label-item.show-more')].find((b) => b.textContent.includes('fewer')));
+        await waitFor(() => expect(statusBtns().some((t) => t.startsWith('Starred'))).toBe(false));
     });
 
     it('Clear appears whenever a filter is active (reactive, not function-tracked)', async () => {
