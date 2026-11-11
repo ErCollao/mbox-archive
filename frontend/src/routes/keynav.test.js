@@ -312,6 +312,22 @@ describe('vim key navigation', () => {
         expect(document.querySelector('.email-item.kcursor')).toBeTruthy(); // cursor kept
     });
 
+    it('a mouse click steps the keyboard out: highlights gone, positions kept', async () => {
+        await mount();
+        await key(window, 'l');
+        await key(window, 'j');
+        expect(document.querySelector('.pane-results.kbd-focus')).toBeTruthy();
+        expect(document.querySelector('.email-item.kcursor')).toBeTruthy();
+        await fireEvent.mouseDown(document.querySelector('.email-item')); // the very interaction that used to leave a lying ring
+        await tick();
+        expect(document.querySelector('.kbd-focus')).toBeFalsy();
+        expect(document.querySelector('.email-item.kcursor')).toBeFalsy();
+        await key(window, 'j'); // back on keyboard: list reclaimed, cursor continues from 0 -> 1
+        const rows = document.querySelectorAll('.email-item');
+        expect(document.querySelector('.pane-results.kbd-focus')).toBeTruthy();
+        expect(rows[1].classList.contains('kcursor')).toBe(true);
+    });
+
     it('f and Enter toggle full screen in the email pane', async () => {
         await mount();
         await key(window, 'l'); await key(window, 'j'); await key(window, 'Enter'); // open

@@ -83,7 +83,13 @@
     }
     onMount(() => {
         const markKb = () => { kbLast = true; };
-        const markMouse = () => { kbLast = false; };
+        const markMouse = () => {
+            kbLast = false;
+            // any real mouse use means the human left the keyboard: step the
+            // mode out (positions kept, exactly like Escape) so the ring never
+            // misrepresents who owns the keys
+            pane = null;
+        };
         document.addEventListener('keydown', markKb, true);
         document.addEventListener('mousedown', markMouse, true);
         document.addEventListener('touchstart', markMouse, true);
