@@ -1,5 +1,5 @@
 [package]
-name = "mbox-browser-backend"
+name = "mbox-archive-backend"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
