@@ -31,7 +31,7 @@ use mboxshell::search;
 use mboxshell::store::reader::MboxStore;
 use tower_http::cors::CorsLayer;
 use walkdir::WalkDir;
-use tracing::{info, error, warn};
+use tracing::{debug, info, error, warn};
 
 /// One person's archive: everything handlers used to share globally is now
 /// scoped to a tenant. Handlers receive it via Extension after cookie auth.
@@ -1329,7 +1329,9 @@ async fn search_handler(
                 sp.processed.store(processed, Ordering::Relaxed);
                 sp.total.store(total, Ordering::Relaxed);
                 if processed > 0 && processed % 5000 == 0 {
-                    info!("Body search progress: {}/{} messages", processed, total);
+                    // the user-visible truth lives in /api/status.search now;
+                    // this is only for server-side diagnosis
+                    debug!("Body search progress: {}/{} messages", processed, total);
                 }
                 true
             };
