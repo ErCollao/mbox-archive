@@ -198,7 +198,7 @@ backup/ profiles/ archive/` cron (or a Synology task) on the host
 covers it. `profiles/` is small and precious: it holds the password
 hashes and address lists.
 
-## ⌨️ Keyboard shortcuts
+## 💻 Keyboard shortcuts
 
 Vim-style navigation in the archive view (in-app help: press `?` or the
 bottom-left corner key). Keys never fire while you're typing in a field —
@@ -219,7 +219,7 @@ there, `hjkl` are just letters.
 | browser Back | closes an open email (opening a thread pushes a history entry, so Back steps out of the email, not out of the app) |
 | `?` | this help |
 
-## 🗂️ Data layout
+## 📁 Data layout
 
 All runtime directories are gitignored and bind-mounted into the backend
 container — which means updates and rollbacks are stateless, and you can
@@ -237,7 +237,7 @@ backup/<slug>/                 gzip backups from the maintenance page
 A broken `profile.json` only skips that one profile — it never takes
 others down.
 
-## 🛠️ Operations
+## 🔧 Operations
 
 **Updates:** `git pull && docker compose up -d --build`. All state lives
 in the bind-mounted folders above, so updating — or rolling back — never
