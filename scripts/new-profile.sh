@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
-# Create a household member's profile without hand-editing JSON.
-#
-#   ./scripts/new-profile.sh hajni "Hajni"
-#
-# Prompts for the password twice, seeds profiles/<user>/profile.json with a
-# sha256 secret (the first successful login upgrades it to bcrypt), creates
-# the folders, and restarts the backend if the stack is already running.
-# Slug and password rules mirror the backend (handlers/account.rs).
+# Create a household member's profile. Pure file operations — meant to run
+# INSIDE the backend container, where /profiles, /data, /archive, /backup
+# are the bind-mounted folders. See README → People for the one-liner.
+# Running it from the repo root on the host works too (relative fallback).
 set -euo pipefail
-
-cd "$(dirname "$0")/.."
 
 usage() { echo "usage: $(basename "$0") <user> [\"Display name\"]" >&2; exit 2; }
 
@@ -22,10 +16,13 @@ if [ -z "$name" ]; then
     name="$(printf '%s' "${slug:0:1}" | tr '[:lower:]' '[:upper:]')${slug:1}"
 fi
 
-if [ -f "profiles/$slug/profile.json" ]; then
-    echo "error: profiles/$slug/profile.json already exists — refusing to overwrite a secret" >&2
-    exit 1
+if [ -d /profiles ]; then
+    P=/profiles; D=/data
+else
+    cd "$(dirname "$0")/.."; P=./profiles; D=./data
 fi
+[ -f "$P/$slug/profile.json" ] \
+    && { echo "error: $slug already has a profile — refusing to overwrite a secret" >&2; exit 1; }
 
 read -rsp "Password for $slug (min 6 chars): " pass1; echo
 read -rsp "Repeat it: " pass2; echo
@@ -37,24 +34,17 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
     hash=$(printf '%s' "$pass1" | shasum -a 256 | cut -d' ' -f1)
 else
-    echo "error: neither sha256sum nor shasum found on this host" >&2; exit 1
+    echo "error: neither sha256sum nor shasum found" >&2; exit 1
 fi
 
 esc_name=$(printf '%s' "$name" | sed 's/\\/\\\\/g; s/"/\\"/g')
-
 umask 077
-mkdir -p "profiles/$slug" "data/$slug"
+mkdir -p "$P/$slug" "$D/$slug"
 printf '{\n  "name": "%s",\n  "secret": "%s"\n}\n' "$esc_name" "$hash" \
-    > "profiles/$slug/profile.json"
+    > "$P/$slug/profile.json"
 
 echo "profile created: $name <$slug>"
-echo "  profiles/$slug/profile.json   (sha256 seed — upgraded to bcrypt on first login)"
-echo "  data/$slug/                   (drop Takeout .mbox files here)"
-
-if docker compose ps 2>/dev/null | grep -q backend; then
-    docker compose restart backend
-    echo "backend restarted — $slug can now sign in."
-else
-    echo "stack not running — it will pick the profile up on the next 'docker compose up -d'."
-fi
-echo "Next: have $slug sign in, then change the password anytime via /profile."
+echo "  $P/$slug/profile.json   (sha256 seed — upgraded to bcrypt on first login)"
+echo "  $D/$slug/               (drop Takeout .mbox files here)"
+echo "Next: docker compose restart backend (while the stack is up) —"
+echo "then $slug can sign in and set name, portrait and addresses under /profile."

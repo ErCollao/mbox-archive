@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
-# Remove a household member's login — and optionally their mail.
+# Remove a household member's login — and optionally their mail. Pure file
+# operations, meant to run INSIDE the backend container (see README → People).
 #
-#   ./scripts/delete-profile.sh hajni            # asks: remove login; then asks
-#                                                #   again whether to also delete
-#                                                #   data/, archive/ and backup/,
-#                                                #   showing the size it frees
-#   ./scripts/delete-profile.sh hajni --purge    # no questions asked (beyond the
-#                                                #   typed-username safety check):
-#                                                #   wipes profile + all mail
+#   delete-profile.sh hajni          # asks: remove login? then offers to
+#                                    #   delete the mail too, size shown first
+#   delete-profile.sh hajni --purge  # profile + all mail data in one go,
+#                                    #   typed-username confirmation
 #
-# Restarting the backend is required for old session cookies to die (the
-# tenant roster is built at boot), so the script restarts whenever the stack
-# is running. Re-adding someone later = ./scripts/new-profile.sh same-slug
-# (an un-deleted archive will be indexed again on next boot).
+# Afterward run 'docker compose restart backend' while the stack is up —
+# old session cookies of the removed profile die with the roster rebuild.
 set -euo pipefail
-
-cd "$(dirname "$0")/.."
 
 usage() { echo "usage: $(basename "$0") <user> [--purge]" >&2; exit 2; }
 
@@ -26,9 +20,11 @@ if [ -n "$mode" ] && [ "$mode" != "--purge" ]; then usage; fi
 [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] \
     || { echo "error: user must be 1-64 chars, letters/digits/_/-, starting alphanumeric" >&2; exit 1; }
 
-if [ ! -d "profiles/$slug" ]; then
+if [ -d /profiles ]; then P=/profiles; D=/data; A=/archive; B=/backup
+else cd "$(dirname "$0")/.."; P=./profiles; D=./data; A=./archive; B=./backup; fi
+if [ ! -d "$P/$slug" ]; then
     echo "error: no profile '$slug'. Existing:" >&2
-    if ! ls profiles 1>&2 2>/dev/null; then echo "  (none)" >&2; fi
+    if ! ls "$P" 1>&2 2>/dev/null; then echo "  (none)" >&2; fi
     exit 1
 fi
 
@@ -46,23 +42,21 @@ human() {
         else                printf "%dK",  k }'
 }
 
-mail_kb=$(total_kb "data/$slug" "archive/$slug" "backup/$slug")
+mail_kb=$(total_kb "$D/$slug" "$A/$slug" "$B/$slug")
 
 if [ "$mode" = "--purge" ]; then
     echo "PURGE '$slug': profile and portrait + all mail data:"
-    du -sh "data/$slug" "archive/$slug" "backup/$slug" 2>/dev/null || true
+    du -sh "$D/$slug" "$A/$slug" "$B/$slug" 2>/dev/null || true
     echo "This cannot be undone."
     read -rp "Type the username to confirm: " typed
     [ "${typed:-}" = "$slug" ] || { echo "confirmation did not match — nothing deleted" >&2; exit 1; }
     keep_mail=no
-    wipe_login=yes
 else
     echo "Removes '$slug's profile and portrait."
-    echo "Their mail is currently $(human "$mail_kb") under data/$slug, archive/$slug, backup/$slug."
+    echo "Their mail is currently $(human "$mail_kb") under $D/$slug (plus archive/ and backup/)."
     read -rp "Proceed with removing the login? [y/N] " ans
-    case "${ans:-n}" in [yY]|[yY][eE][sS]) wipe_login=yes ;; *) echo "aborted" >&2; exit 1 ;; esac
+    case "${ans:-n}" in [yY]|[yY][eE][sS]) ;; *) echo "aborted" >&2; exit 1 ;; esac
     if [ "$mail_kb" = "0" ]; then
-        # nothing under data/archive/backup worth keeping — tidy up the folders
         keep_mail=no
     else
         read -rp "Also delete their mail files ($(human "$mail_kb") will be freed)? [y/N] " ans
@@ -70,32 +64,21 @@ else
     fi
 fi
 
-if [ "$wipe_login" = yes ]; then
-    rm -rf "profiles/$slug"
-fi
+rm -rf "$P/$slug"
 if [ "$keep_mail" = no ]; then
-    rm -rf "data/$slug" "archive/$slug" "backup/$slug"
+    rm -rf "$D/$slug" "$A/$slug" "$B/$slug"
 fi
 
-if [ "$keep_mail" = yes ]; then
-    echo "mail kept on disk: data/$slug, archive/$slug, backup/$slug — delete-profile.sh again anytime, or wipe by hand."
-fi
-
-remaining=$(find profiles -mindepth 2 -name profile.json 2>/dev/null | wc -l | tr -d ' ')
+remaining=$(find "$P" -mindepth 2 -name profile.json 2>/dev/null | wc -l | tr -d ' ')
 if [ "$remaining" = "0" ]; then
     echo "warning: '$slug' was the last profile — with no valid roster the backend"
     echo "refuses to start (fail-closed). Create a new one before restarting:"
     echo "  ./scripts/new-profile.sh <user>"
 fi
 
-if docker compose ps 2>/dev/null | grep -q backend; then
-    docker compose restart backend
-    echo "backend restarted — $slug's old session cookies are now dead."
-else
-    echo "stack not running — removal takes effect on the next 'docker compose up -d'."
-fi
 if [ "$keep_mail" = no ] && [ "$mail_kb" != "0" ]; then
     echo "done: '$slug' removed; $(human "$mail_kb") freed."
 else
     echo "done: '$slug' removed."
 fi
+echo "Apply it: docker compose restart backend (while the stack is up)."
