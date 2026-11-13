@@ -14,7 +14,7 @@ syncing — it serves the archives you export. The whole app is two Docker
 containers (a Rust/axum backend and a SvelteKit frontend) plus a handful
 of bind-mounted folders.
 
-![Searching, filtering and reading the archive with keyboard navigation](.github/img/hero.gif)
+![Searching, filtering and reading the archive with keyboard navigation](.github/img/01-hero.gif)
 
 ## 📋 Contents
 
@@ -128,9 +128,9 @@ holds off until the backend reports healthy.
 Open `http://localhost:3132`: everyone on the LAN picks who they are —
 each profile sees only its own archive.
 
-![Who's browsing? The sign-in chooser](.github/img/01-welcome.png)
+![Who's browsing? The sign-in chooser](.github/img/02-welcome.png)
 
-![Signing in](.github/img/01b-password.png)
+![Signing in](.github/img/03-password.png)
 
 ### 4. Import your mail
 
@@ -147,7 +147,7 @@ as many files as Takeout gave you. Then in the app:
 The runbook spells out the real folder names at each step, so you can
 follow it without reading this README again.
 
-![The maintenance runbook with live stats: indexed counts, date range, and the numbered steps](.github/img/05-maintenance.png)
+![The maintenance runbook with live stats: indexed counts, date range, and the numbered steps](.github/img/04-maintenance.png)
 
 ### 5. Personalize
 
@@ -158,7 +158,7 @@ browser and shown on the sign-in chooser). Changes hit
 `profiles/you/profile.json` immediately; no restart, and a rename never
 logs anyone out.
 
-![The profile page: display name, password, portrait, addresses](.github/img/06-profile.png)
+![The profile page: display name, password, portrait, addresses](.github/img/05-profile.png)
 
 ## 🧭 Daily use
 
@@ -170,13 +170,13 @@ quick.
 The archive view is three panes — facets, threads, reader — and lands on
 your primary category like Gmail does:
 
-![The archive view: facets, thread list with identity chips, reader pane](.github/img/02-archive.png)
+![The archive view: facets, thread list with identity chips, reader pane](.github/img/06-archive.png)
 
 Search is instant full-text over subjects and bodies (press `Enter` to
 run it); clicking a hit opens the thread — grouped by Gmail's own id —
 with the messages navigable via `j`/`k`:
 
-![Searching `ledger`: eight conversations; the open thread shows its five messages](.github/img/03-search.png)
+![Searching `ledger`: eight conversations; the open thread shows its five messages](.github/img/07-search.png)
 
 And it fits your phone — the same archive, drawer-based layout, no app
 store required:
@@ -272,7 +272,7 @@ Vim-style navigation in the archive view (in-app help: press `?` or the
 bottom-left corner key). Keys never fire while you're typing in a field —
 there, `hjkl` are just letters.
 
-![The in-app help overlay](.github/img/07-shortcuts.png)
+![The in-app help overlay](.github/img/09-shortcuts.png)
 
 | Key | What |
 |---|---|
