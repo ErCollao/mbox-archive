@@ -14,6 +14,8 @@ syncing — it serves the archives you export. The whole app is two Docker
 containers (a Rust/axum backend and a SvelteKit frontend) plus a handful
 of bind-mounted folders.
 
+![Searching, filtering and reading the archive with keyboard navigation](.github/img/hero.gif)
+
 ## 📋 Contents
 
 - [Features](#-features)
@@ -80,19 +82,37 @@ The backend deliberately refuses to start with zero valid profiles
 (fail-closed), so create yourself first:
 
 ```sh
-mkdir -p profiles/you data/you
-printf '%s' 'the password' | shasum -a 256 | cut -d' ' -f1
+./scripts/new-profile.sh daniel "Daniel"
 ```
 
-Put the hash into `profiles/you/profile.json`:
+The script prompts for the password twice, creates `profiles/daniel/`
+and `data/daniel/`, seeds `profile.json` with a sha256 secret — the
+first successful login transparently upgrades it to bcrypt — and
+restarts the backend if the stack is already up. (Adding anyone else
+later is the same one-liner, see [Daily use](#-daily-use).)
+
+Prefer by hand, or running on a box without the script? The seed hash
+is just `sha256(password)` in lowercase hex:
+
+```sh
+printf '%s' 'the password' | shasum -a 256 | cut -d' ' -f1   # or sha256sum
+```
+
+...then write `profiles/daniel/profile.json` yourself:
 
 ```json
-{ "name": "You", "secret": "<the sha256 hex from above>" }
+{ "name": "Daniel", "secret": "<the sha256 hex from above>" }
 ```
 
-The first successful login transparently upgrades the sha256 seed to a
-bcrypt hash. Demo profiles from the initial migration use passwords
-`daniel` and `hajni` — change them via `/profile` if you see them.
+Docker-only host (no bash/shasum handy)? Run the script inside the image
+instead — it works before the first `up -d` (it builds the image as a
+side effect):
+
+```sh
+docker compose run --rm --build -v "$PWD/scripts:/scripts:ro" backend bash /scripts/new-profile.sh daniel "Daniel"
+```
+
+Then continue with step 3.
 
 ### 3. Start the containers
 
@@ -104,6 +124,13 @@ First boot auto-creates `archive/session.key` (the cookie signing key)
 and indexes every profile's newest mbox. On very large archives, wait
 for `Indexing complete` in `docker compose logs backend`. The frontend
 holds off until the backend reports healthy.
+
+Open `http://localhost:3132`: everyone on the LAN picks who they are —
+each profile sees only its own archive.
+
+![Who's browsing? The sign-in chooser](.github/img/01-welcome.png)
+
+![Signing in](.github/img/01b-password.png)
 
 ### 4. Import your mail
 
@@ -120,6 +147,8 @@ as many files as Takeout gave you. Then in the app:
 The runbook spells out the real folder names at each step, so you can
 follow it without reading this README again.
 
+![The maintenance runbook with live stats: indexed counts, date range, and the numbered steps](.github/img/05-maintenance.png)
+
 ### 5. Personalize
 
 Sign in and open the avatar chip (top-left) → `/profile`: set your
@@ -129,6 +158,8 @@ browser and shown on the sign-in chooser). Changes hit
 `profiles/you/profile.json` immediately; no restart, and a rename never
 logs anyone out.
 
+![The profile page: display name, password, portrait, addresses](.github/img/06-profile.png)
+
 ## 🧭 Daily use
 
 New mail is the same loop: drop files into `data/<slug>/`, then Merge →
@@ -136,17 +167,54 @@ Re-scan from the ⚙ page. Browsing, searching and filtering happen in the
 archive view; the [keyboard shortcuts](#-keyboard-shortcuts) make it
 quick.
 
+The archive view is three panes — facets, threads, reader — and lands on
+your primary category like Gmail does:
+
+![The archive view: facets, thread list with identity chips, reader pane](.github/img/02-archive.png)
+
+Search is instant full-text over subjects and bodies (press `Enter` to
+run it); clicking a hit opens the thread — grouped by Gmail's own id —
+with the messages navigable via `j`/`k`:
+
+![Searching `ledger`: eight conversations; the open thread shows its five messages](.github/img/03-search.png)
+
+And it fits your phone — the same archive, drawer-based layout, no app
+store required:
+
+![Mobile layout with the filter drawer open](.github/img/08-mobile.gif)
+
 ### Adding or removing a person
 
+Two helper scripts do the whole job — password prompt, folders, profile
+seed, backend restart. Run them on the machine hosting the stack, from
+the folder you cloned:
+
 ```sh
-mkdir -p profiles/newname data/newname
-$EDITOR profiles/newname/profile.json     # name + secret (see step 2)
+./scripts/new-profile.sh hajni "Hajni"    # prompts twice for the password
+./scripts/delete-profile.sh hajni         # removes the login; then offers to
+                                          # delete the mail too (size shown
+                                          # before you say yes; mail is never
+                                          # removed without an explicit yes)
+./scripts/delete-profile.sh hajni --purge # profile + data/ + archive/ + backup/
+                                          # in one go, typed-username confirmed
+```
+
+**Docker-only hosts** (Windows, Synology — anywhere you'd rather not rely on
+host bash): run the same scripts *inside* the backend container. The
+bind-mounted folders mean the effect is identical; just restart after:
+
+```sh
+docker compose run --rm --build -v "$PWD/scripts:/scripts:ro" backend bash /scripts/new-profile.sh hajni "Hajni"
+docker compose run --rm --build -v "$PWD/scripts:/scripts:ro" backend bash /scripts/delete-profile.sh hajni
 docker compose restart backend
 ```
 
-Removing = delete the folder (their `archive/` and `data/` stay on disk
-unless you also wipe them). Session cookies for deleted profiles die
-with them — they're checked against the roster on every request.
+New people sign in and personalize their name, portrait and addresses
+under `/profile`. Removing takes effect immediately because the scripts
+restart the backend — old session cookies of a removed profile die with
+the roster rebuild. By hand it's the same two moves: delete
+`profiles/<slug>/`, restart; `data/` and `archive/` stay until you wipe
+them.
 
 ### Multiple accounts & aliases
 
@@ -203,6 +271,8 @@ hashes and address lists.
 Vim-style navigation in the archive view (in-app help: press `?` or the
 bottom-left corner key). Keys never fire while you're typing in a field —
 there, `hjkl` are just letters.
+
+![The in-app help overlay](.github/img/07-shortcuts.png)
 
 | Key | What |
 |---|---|
@@ -268,9 +338,12 @@ live profiles:
 ```
 
 `test-env/` runs as its own compose project (`-p mbxtest`) with its own
-volumes, ports, and profiles; its runtime dirs are gitignored. The live
-`profiles/`, `data/`, `archive/` folders are user data — treat them as
-production: read-only, or don't touch.
+volumes, ports, and profiles; its runtime dirs are gitignored. The
+fixture `demo.mbox` (400 fictional messages, all addresses on the
+reserved `.test` TLD) is seeded automatically for screenshots and
+manual checks — regenerate with `python3 test-env/fixtures/make-demo-mbox.py`.
+The live `profiles/`, `data/`, `archive/` folders are user data — treat
+them as production: read-only, or don't touch.
 
 ## 🔐 Security & threat model
 

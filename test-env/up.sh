@@ -16,6 +16,12 @@ if [ -f fixtures/sample.mbox ]; then
     cp fixtures/sample.mbox data/tester/sample.mbox
 fi
 
+# optional bulk demo content for screenshots (regenerate with
+# python3 fixtures/make-demo-mbox.py — 400 fictional messages, all .test)
+if [ -f fixtures/demo.mbox ]; then
+    cp fixtures/demo.mbox data/tester/demo.mbox
+fi
+
 # seeded with the legacy sha256 form on purpose: first login upgrades it,
 # which exercises that path too. Addresses are pre-declared so identity
 # tagging, filtering and row chips are active from the very first scan.

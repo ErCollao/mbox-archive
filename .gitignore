@@ -13,3 +13,8 @@ test-env/profiles/
 test-env/data/
 test-env/archive/
 test-env/backup/
+
+# macOS + capture artifacts
+.DS_Store
+**/.DS_Store
+.github/img/*.mov
